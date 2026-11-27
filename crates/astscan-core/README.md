@@ -6,6 +6,16 @@ worker. The scanner flattens each syntax tree once and dispatches candidate
 rules by node kind. Identical matchers run once even when several rule IDs
 share them.
 
+## Installation
+
+Use Rust 1.90 or later and a C compiler.
+
+```sh
+cargo add astscan-core
+```
+
+## Quick Start
+
 ```rust
 use astscan_core::{Registry, RuleSet, Scanner};
 
@@ -18,14 +28,17 @@ rule:
 let rules = RuleSet::compile(yaml, &mut Registry::default()).unwrap();
 let mut scanner = Scanner::new(&rules);
 let source = "console.log('hello');";
+let mut matches = 0;
 
 scanner.scan("js", source, |found| {
+    matches += 1;
     assert_eq!(found.rules().next().unwrap().id, "log-call");
     for (name, bytes) in found.single_captures() {
         assert_eq!(name, "ARG");
         assert_eq!(&source[bytes.start as usize..bytes.end as usize], "'hello'");
     }
 }).unwrap();
+assert_eq!(matches, 1);
 ```
 
 Results borrow the scanner's buffers for the duration of the callback.
@@ -45,5 +58,6 @@ The default parser uses tree-sitter. `Scanner::with_parser` can opt into
 tree-sitter when it needs error recovery. Building the library requires a C
 compiler for the grammars and the tree-flattening routine.
 
-See the [repository README](../../README.md) for the supported rule syntax
-and CLI benchmarks.
+See the [supported rule syntax](https://github.com/mizchi/astscan#compatibility)
+and [CLI benchmarks](https://github.com/mizchi/astscan/blob/main/docs/performance.md).
+Licensed under MIT.
