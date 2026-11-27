@@ -34,6 +34,12 @@ original source, including for scripts and styles embedded in HTML.
 `Match::rules` yields the rule metadata after applying `ast-grep-ignore`.
 Compilation warnings are available via `RuleSet::warnings`.
 
+`Scanner::with_optimizations` accepts `ScanOptimizations` to select source
+literal checks and worker-local regex scratch space independently.
+The default `LiteralPrefilter::Files` skips parsing when all rule groups can
+be ruled out. `LiteralPrefilter::FilesAndGroups` also bypasses individual rule
+groups in files that still need parsing.
+
 The default parser uses tree-sitter. `Scanner::with_parser` can opt into
 `ParserKind::Fast`, which drives the same grammars and falls back to
 tree-sitter when it needs error recovery. Building the library requires a C

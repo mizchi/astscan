@@ -68,3 +68,73 @@ fn deeply_nested_source_scans_on_a_small_thread_stack() {
     .join()
     .unwrap();
 }
+
+#[test]
+fn scanner_optimizations_preserve_matches_across_sources() {
+  use astscan_core::{LiteralPrefilter, ScanOptimizations};
+
+  let yaml = r#"
+id: literal
+language: JavaScript
+rule:
+  pattern: logValue($ARG)
+---
+id: regex
+language: JavaScript
+rule:
+  kind: call_expression
+  has:
+    field: function
+    regex: '^(alert|warn)(?:Message)?$'
+---
+id: either
+language: JavaScript
+rule:
+  any:
+    - pattern: getValue($ARG)
+    - kind: number
+---
+id: signature
+language: JavaScript
+rule:
+  pattern:
+    context: 'getInfo($ARG)'
+    selector: call_expression
+    strictness: signature
+"#;
+  let rules = RuleSet::compile(yaml, &mut Registry::default()).unwrap();
+  let sources = [
+    ("js", "// ast-grep-ignore: literal\nlogValue(1); alertMessage('日本');"),
+    ("js", "warn('é'); otherFunction(20);"),
+    ("html", "<script>logValue('hello');</script><script>warn(3);</script>"),
+    ("js", "let x = 4;"),
+    ("js", "logValue(5);"),
+  ];
+  let collect = |optimizations| {
+    let mut scanner = Scanner::new(&rules).with_optimizations(optimizations);
+    let mut matches = Vec::new();
+    for (language, source) in sources {
+      scanner
+        .scan(language, source, |found| {
+          matches.push((
+            found.language().to_owned(),
+            found.range(),
+            found.rules().map(|rule| rule.id.clone()).collect::<Vec<_>>(),
+            found.single_captures().map(|(name, range)| (name.to_owned(), range)).collect::<Vec<_>>(),
+            found.labels().collect::<Vec<_>>(),
+          ));
+        })
+        .unwrap();
+    }
+    matches
+  };
+  let baseline = collect(ScanOptimizations { literal_prefilter: LiteralPrefilter::Off, worker_local_regex: false });
+  for id in ["literal", "regex", "either", "signature"] {
+    assert!(baseline.iter().any(|(_, _, rules, _, _)| rules.iter().any(|rule| rule == id)));
+  }
+  for literal_prefilter in [LiteralPrefilter::Off, LiteralPrefilter::Files, LiteralPrefilter::FilesAndGroups] {
+    for worker_local_regex in [false, true] {
+      assert_eq!(collect(ScanOptimizations { literal_prefilter, worker_local_regex }), baseline);
+    }
+  }
+}

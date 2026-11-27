@@ -70,6 +70,7 @@ pub struct Matcher<'a> {
   pub t: &'a FlatTree,
   pub src: &'a str,
   pub utils: &'a [Rule],
+  pub regexes: &'a [regex::Regex],
 }
 
 impl<'a> Matcher<'a> {
@@ -110,7 +111,7 @@ impl<'a> Matcher<'a> {
     match rule {
       Rule::Kind(k) => (self.kind(n) == *k).then_some(n),
       Rule::Pattern(p) => self.match_pattern(p, n, env).then_some(n),
-      Rule::Regex(re) => re.is_match(self.text(n)).then_some(n),
+      Rule::Regex(index) => self.regexes[*index].is_match(self.text(n)).then_some(n),
       Rule::NthChild(nc) => self.nth_child(nc, n, env),
       Rule::All(rules, kinds) => {
         if let Some(k) = kinds

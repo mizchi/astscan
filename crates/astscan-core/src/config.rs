@@ -10,6 +10,7 @@
 //! under every id in the group.
 
 use crate::lang::{CustomDecl, Lang, Registry};
+use crate::prefilter::Prefilter;
 use crate::rule::{Interner, RuleCore, compile_core};
 use serde_yaml::Value;
 use std::collections::HashMap;
@@ -55,6 +56,8 @@ pub struct Unit {
   /// Kind id to the groups whose matcher can match that kind.
   pub(crate) kind_map: Vec<Vec<u32>>,
   pub(crate) var_names: Vec<String>,
+  pub(crate) regexes: Vec<regex::Regex>,
+  pub(crate) prefilter: Option<Prefilter>,
 }
 
 #[cfg(feature = "internals")]
@@ -306,7 +309,14 @@ type Note = (usize, String);
 
 fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Unit, Vec<Note>), Note> {
   let mut vars = Interner::default();
-  let mut unit = Unit { kind_map: vec![Vec::new(); lang.nkinds], lang: lang.clone(), groups: Vec::new(), var_names: Vec::new() };
+  let mut unit = Unit {
+    kind_map: vec![Vec::new(); lang.nkinds],
+    lang: lang.clone(),
+    groups: Vec::new(),
+    var_names: Vec::new(),
+    regexes: Vec::new(),
+    prefilter: None,
+  };
   let mut group_index: HashMap<String, usize> = HashMap::new();
   let mut warnings = Vec::new();
 
@@ -322,7 +332,7 @@ fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Uni
       unit.groups[g].metas.push(meta);
       continue;
     }
-    let core = compile_core(rule, constraints, utils, lang, &mut vars).map_err(fail)?;
+    let core = compile_core(rule, constraints, utils, lang, &mut vars, &mut unit.regexes).map_err(fail)?;
     let g = unit.groups.len();
     match &core.kinds {
       Some(kinds) => {
@@ -340,5 +350,6 @@ fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Uni
   }
 
   unit.var_names = vars.names;
+  unit.prefilter = Prefilter::compile(&unit.groups, &unit.regexes);
   Ok((unit, warnings))
 }

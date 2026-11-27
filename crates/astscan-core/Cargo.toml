@@ -44,6 +44,7 @@ serde = "1"
 serde_yaml = "0.9"
 serde_json = "1"
 regex = "1"
+regex-syntax = "0.8"
 memchr = "2"
 libloading = "0.8"
 

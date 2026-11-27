@@ -58,6 +58,14 @@ pub struct LineIndex {
   ascii: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct IndexedRange {
+  start: u32,
+  end: u32,
+  start_position: (usize, usize),
+  end_position: (usize, usize),
+}
+
 const BLOCK: usize = 64;
 
 impl LineIndex {
@@ -83,6 +91,11 @@ impl LineIndex {
     if line == 0 { 0 } else { self.newlines[line - 1] as usize + 1 }
   }
   #[inline]
+  pub fn range(&self, src: &[u8], start: u32, end: u32) -> IndexedRange {
+    IndexedRange { start, end, start_position: self.position(src, start), end_position: self.position(src, end) }
+  }
+
+  #[inline]
   fn chars_up_to(&self, src: &[u8], offset: usize) -> usize {
     let block = offset / BLOCK;
     match self.chars_before.get(block) {
@@ -103,9 +116,8 @@ impl LineIndex {
 }
 
 /// `{"byteOffset":{"start":S,"end":E},"start":{"line":L,"column":C},"end":{…}}`
-pub fn write_range(out: &mut Vec<u8>, src: &[u8], idx: &LineIndex, start: u32, end: u32) {
-  let (sl, sc) = idx.position(src, start);
-  let (el, ec) = idx.position(src, end);
+pub fn write_range(out: &mut Vec<u8>, range: IndexedRange) {
+  let IndexedRange { start, end, start_position: (sl, sc), end_position: (el, ec) } = range;
   out.extend_from_slice(b"{\"byteOffset\":{\"start\":");
   write_num(out, start as usize);
   out.extend_from_slice(b",\"end\":");
@@ -121,17 +133,20 @@ pub fn write_range(out: &mut Vec<u8>, src: &[u8], idx: &LineIndex, start: u32, e
   out.extend_from_slice(b"}}");
 }
 
-/// The source lines a match touches, as ast-grep's `lines` and `charCount`.
-pub fn write_lines(out: &mut Vec<u8>, src: &[u8], start: u32, end: u32) {
-  let (start, end) = (start as usize, (end as usize).min(src.len()));
-  let leading = memchr::memrchr(b'\n', &src[..start]).map_or(0, |i| i + 1);
-  let trailing = memchr::memchr(b'\n', &src[end..]).map_or(src.len(), |i| end + i);
-  out.extend_from_slice(b",\"lines\":");
-  write_json_str(out, &src[leading..trailing]);
-  out.extend_from_slice(b",\"charCount\":{\"leading\":");
-  write_num(out, count_chars(&src[leading..start]));
+/// The source lines a match touches, reusing the escaped contents of its `text` field.
+pub fn write_lines(out: &mut Vec<u8>, src: &[u8], idx: &LineIndex, range: IndexedRange, escaped_match: &[u8]) {
+  let leading = idx.line_start(range.start_position.0);
+  let trailing = idx.newlines.get(range.end_position.0).map_or(src.len(), |&offset| offset as usize);
+  let end = range.end as usize;
+  let trailing_chars = if idx.ascii { trailing - end } else { idx.chars_up_to(src, trailing) - idx.chars_up_to(src, end) };
+  out.extend_from_slice(b",\"lines\":\"");
+  write_json_escaped(out, &src[leading..range.start as usize]);
+  out.extend_from_slice(escaped_match);
+  write_json_escaped(out, &src[end..trailing]);
+  out.extend_from_slice(b"\",\"charCount\":{\"leading\":");
+  write_num(out, range.start_position.1);
   out.extend_from_slice(b",\"trailing\":");
-  write_num(out, count_chars(&src[end..trailing]));
+  write_num(out, trailing_chars);
   out.push(b'}');
 }
 
@@ -160,6 +175,34 @@ mod tests {
     assert_eq!(idx.position(src.as_bytes(), 3), (0, 2));
     assert_eq!(idx.position(src.as_bytes(), 4), (1, 0));
     assert_eq!(idx.position(src.as_bytes(), 10), (1, 2));
+  }
+
+  #[test]
+  fn indexed_lines_preserve_line_endings_and_character_counts() {
+    for src in ["", "plain\ntext\n", "é前\r\n\n next 日本\n終", &"é".repeat(32)] {
+      let bytes = src.as_bytes();
+      let offsets: Vec<_> = src.char_indices().map(|(i, _)| i).chain([src.len()]).collect();
+      let mut idx = LineIndex::default();
+      idx.build(bytes);
+      let mut out = Vec::new();
+      for (i, &start) in offsets.iter().enumerate() {
+        for &end in &offsets[i..] {
+          out.clear();
+          out.push(b'{');
+          out.extend_from_slice(b"\"test\":0");
+          let mut escaped_match = Vec::new();
+          write_json_escaped(&mut escaped_match, &bytes[start..end]);
+          write_lines(&mut out, bytes, &idx, idx.range(bytes, start as u32, end as u32), &escaped_match);
+          out.push(b'}');
+          let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+          let line_start = src[..start].rfind('\n').map_or(0, |i| i + 1);
+          let line_end = src[end..].find('\n').map_or(src.len(), |i| end + i);
+          assert_eq!(value["lines"], &src[line_start..line_end]);
+          assert_eq!(value["charCount"]["leading"], src[line_start..start].chars().count());
+          assert_eq!(value["charCount"]["trailing"], src[end..line_end].chars().count());
+        }
+      }
+    }
   }
 
   #[test]

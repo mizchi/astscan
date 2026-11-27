@@ -23,7 +23,7 @@ pub struct Compiled {
 }
 
 struct OutputUnit {
-  language: String,
+  language_json: Vec<u8>,
   groups: Vec<Vec<JsonRule>>,
   var_keys: Vec<Vec<u8>>,
 }
@@ -72,7 +72,9 @@ impl Compiled {
             key
           })
           .collect();
-        OutputUnit { language: unit.language().to_string(), groups, var_keys }
+        let mut language_json = Vec::new();
+        write_json_str(&mut language_json, unit.language().as_bytes());
+        OutputUnit { language_json, groups, var_keys }
       })
       .collect();
     Self { rules, output }
@@ -95,6 +97,10 @@ pub struct Shared<'a> {
   pub options: ScanOptions,
   pub fast_parsed: [AtomicUsize; 2],
   pub phase_nanos: [AtomicUsize; 3],
+  pub skipped_parses: AtomicUsize,
+  pub skipped_bytes: AtomicUsize,
+  pub rejected_groups: AtomicUsize,
+  pub prefilter_nanos: AtomicUsize,
   pub slow: Option<std::sync::Mutex<Vec<(u128, String)>>>,
 }
 
@@ -124,6 +130,7 @@ pub struct Worker<'a> {
   out: Vec<u8>,
   head: Vec<u8>,
   text: Vec<u8>,
+  path_json: Vec<u8>,
   src: Vec<u8>,
   /// Matches and error-severity matches of the file being scanned.
   matched: usize,
@@ -147,6 +154,7 @@ impl<'a> Worker<'a> {
       out: Vec::with_capacity(FLUSH_AT * 2),
       head: Vec::new(),
       text: Vec::new(),
+      path_json: Vec::new(),
       src: Vec::new(),
       matched: 0,
       errors: 0,
@@ -259,6 +267,8 @@ impl<'a> Worker<'a> {
     }
 
     self.lines.build(src);
+    self.path_json.clear();
+    write_json_str(&mut self.path_json, path.as_bytes());
     let mut reader = Reader::new(payload);
     let mut unit = &compiled.output[0];
     while let Ok(Some(item)) = reader.next(&mut self.found) {
@@ -271,7 +281,7 @@ impl<'a> Worker<'a> {
             text: &mut self.text,
             lines: &self.lines,
             src,
-            path,
+            path_json: &self.path_json,
             mode: shared.mode,
             unit,
             keys: &unit.var_keys,
@@ -303,6 +313,8 @@ impl<'a> Worker<'a> {
     let stats = scanner.scan_target(text, target, |idx, found| {
       if !lines_built {
         self.lines.build(src);
+        self.path_json.clear();
+        write_json_str(&mut self.path_json, display.as_bytes());
         lines_built = true;
       }
       if recording {
@@ -319,7 +331,7 @@ impl<'a> Worker<'a> {
         text: &mut self.text,
         lines: &self.lines,
         src,
-        path: display,
+        path_json: &self.path_json,
         mode: shared.mode,
         unit,
         keys: &unit.var_keys,
@@ -336,6 +348,13 @@ impl<'a> Worker<'a> {
         shared.file_count.fetch_add(stats.files, Ordering::Relaxed);
         shared.byte_count.fetch_add(stats.bytes, Ordering::Relaxed);
         if shared.options.timed {
+          let prefilter = stats.prefilter;
+          if prefilter.nanos > 0 || prefilter.rejected_groups > 0 {
+            shared.skipped_parses.fetch_add(prefilter.skipped_parses, Ordering::Relaxed);
+            shared.skipped_bytes.fetch_add(prefilter.skipped_bytes, Ordering::Relaxed);
+            shared.rejected_groups.fetch_add(prefilter.rejected_groups, Ordering::Relaxed);
+            shared.prefilter_nanos.fetch_add(prefilter.nanos, Ordering::Relaxed);
+          }
           for (total, elapsed) in shared.phase_nanos.iter().zip(stats.phase_nanos) {
             total.fetch_add(elapsed, Ordering::Relaxed);
           }
@@ -386,7 +405,7 @@ struct Emit<'a, 'b> {
   text: &'b mut Vec<u8>,
   lines: &'b LineIndex,
   src: &'b [u8],
-  path: &'b str,
+  path_json: &'b [u8],
   mode: Mode,
   unit: &'a OutputUnit,
   /// Metavariable names as JSON object keys.
@@ -402,7 +421,7 @@ impl Emit<'_, '_> {
       out.push(b',');
     }
     out.extend_from_slice(b"\"range\":");
-    write_range(out, self.src, self.lines, s, e);
+    write_range(out, self.lines.range(self.src, s, e));
     out.push(b'}');
   }
 
@@ -463,6 +482,7 @@ impl Emit<'_, '_> {
 /// `(lines, error-severity lines)`.
 fn emit(e: &mut Emit, rules: &[JsonRule], f: &Found) -> (usize, usize) {
   let (start, end) = (f.start, f.end);
+  let range = e.lines.range(e.src, start, end);
   let live = |i: usize| !f.dead.contains(&(i as u32));
   let metas = || rules.iter().enumerate().filter(|(i, _)| live(*i)).map(|(_, m)| m);
   let mut count = 0;
@@ -473,11 +493,11 @@ fn emit(e: &mut Emit, rules: &[JsonRule], f: &Found) -> (usize, usize) {
   match e.mode {
     Mode::Slim => {
       head.extend_from_slice(b"{\"file\":");
-      write_json_str(&mut head, e.path.as_bytes());
+      head.extend_from_slice(e.path_json);
       head.extend_from_slice(b",\"language\":");
-      write_json_str(&mut head, e.unit.language.as_bytes());
+      head.extend_from_slice(&e.unit.language_json);
       head.extend_from_slice(b",\"range\":");
-      write_range(&mut head, e.src, e.lines, start, end);
+      write_range(&mut head, range);
       e.meta_variables(&mut head, f, false);
       head.extend_from_slice(b",\"ruleIds\":[");
       for meta in metas() {
@@ -503,13 +523,13 @@ fn emit(e: &mut Emit, rules: &[JsonRule], f: &Found) -> (usize, usize) {
       head.extend_from_slice(&text);
       head.extend_from_slice(b",\"range\":");
       let range_at = head.len();
-      write_range(&mut head, e.src, e.lines, start, end);
+      write_range(&mut head, range);
       let range_end = head.len();
       head.extend_from_slice(b",\"file\":");
-      write_json_str(&mut head, e.path.as_bytes());
-      write_lines(&mut head, e.src, start, end);
+      head.extend_from_slice(e.path_json);
+      write_lines(&mut head, e.src, e.lines, range, &text[1..text.len() - 1]);
       head.extend_from_slice(b",\"language\":");
-      write_json_str(&mut head, e.unit.language.as_bytes());
+      head.extend_from_slice(&e.unit.language_json);
       e.meta_variables(&mut head, f, true);
       for meta in metas() {
         e.out.extend_from_slice(&head);
@@ -523,7 +543,7 @@ fn emit(e: &mut Emit, rules: &[JsonRule], f: &Found) -> (usize, usize) {
           e.out.extend_from_slice(b",{\"text\":");
           write_json_str(e.out, &e.src[s as usize..en as usize]);
           e.out.extend_from_slice(b",\"range\":");
-          write_range(e.out, e.src, e.lines, s, en);
+          write_range(e.out, e.lines.range(e.src, s, en));
           e.out.extend_from_slice(b",\"style\":\"secondary\"}");
         }
         e.out.extend_from_slice(b"]}\n");

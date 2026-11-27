@@ -5,6 +5,7 @@ use crate::eval::{Env, Matcher};
 use crate::fastparse::Parser as FastParser;
 use crate::found::{Found, Span};
 use crate::lang::{HTML, HtmlInjections, INJECTABLE, Registry};
+use crate::prefilter::PrefilterScratch;
 use crate::tree::{FlatTree, NONE, first_difference};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -101,11 +102,32 @@ pub enum Target {
   Html,
 }
 
+/// How to use necessary literals before structural matching.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LiteralPrefilter {
+  Off,
+  /// Check only when every group can be rejected, so parsing may be skipped.
+  #[default]
+  Files,
+  /// Also check mixed rule sets and bypass individual rejected groups.
+  FilesAndGroups,
+}
+
+/// Independent optimizations for in-memory scans.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanOptimizations {
+  /// Reject rule groups whose required bytes are absent from the source.
+  pub literal_prefilter: LiteralPrefilter,
+  /// Give each scanner separate regex scratch space, sharing compiled regexes.
+  pub worker_local_regex: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct ScanOptions {
   pub parser: ParserKind,
   pub check_flatten: bool,
   pub timed: bool,
+  pub optimizations: ScanOptimizations,
 }
 
 #[derive(Default)]
@@ -114,6 +136,15 @@ pub struct ScanStats {
   pub bytes: usize,
   pub fast_parsed: [usize; 2],
   pub phase_nanos: [usize; 3],
+  pub prefilter: PrefilterStats,
+}
+
+#[derive(Default)]
+pub struct PrefilterStats {
+  pub skipped_parses: usize,
+  pub skipped_bytes: usize,
+  pub rejected_groups: usize,
+  pub nanos: usize,
 }
 
 /// `// ast-grep-ignore` comments of one file. `None` as a rule set means every rule.
@@ -153,6 +184,8 @@ pub struct Scanner<'a> {
   fast_parsers: Vec<Option<Option<FastParser>>>,
   tree: FlatTree,
   env: Env,
+  local_regexes: Vec<Option<Vec<regex::Regex>>>,
+  prefilter: PrefilterScratch,
   newlines: Vec<u32>,
   found: Found,
 }
@@ -164,6 +197,12 @@ impl<'a> Scanner<'a> {
 
   pub fn with_parser(rules: &'a RuleSet, parser: ParserKind) -> Self {
     Self::configured(rules, ScanOptions { parser, ..ScanOptions::default() })
+  }
+
+  /// Choose which optimizations to use with this scanner and parser.
+  pub fn with_optimizations(mut self, optimizations: ScanOptimizations) -> Self {
+    self.options.optimizations = optimizations;
+    self
   }
 
   #[cfg(feature = "internals")]
@@ -181,6 +220,8 @@ impl<'a> Scanner<'a> {
       fast_parsers: rules.units.iter().map(|_| None).collect(),
       tree: FlatTree::default(),
       env: Env::default(),
+      local_regexes: rules.units.iter().map(|_| None).collect(),
+      prefilter: PrefilterScratch::default(),
       newlines: Vec::new(),
       found: Found::default(),
     }
@@ -249,6 +290,33 @@ impl<'a> Scanner<'a> {
         *phase += t.elapsed().as_nanos() as usize;
       }
     };
+    stats.files += 1;
+    stats.bytes += src.len();
+    let mode = self.options.optimizations.literal_prefilter;
+    let rejected_groups = if !self.options.check_flatten
+      && mode != LiteralPrefilter::Off
+      && let Some(plan) = &unit.prefilter
+      && (mode == LiteralPrefilter::FilesAndGroups || plan.covers_all_groups())
+    {
+      let started = clock();
+      // Checking the whole source also covers any included range in an HTML injection.
+      let rejected = self.prefilter.check(plan, src.as_bytes(), mode == LiteralPrefilter::Files);
+      lap(&mut stats.prefilter.nanos, started);
+      if rejected == unit.groups.len() {
+        stats.prefilter.skipped_parses += 1;
+        stats.prefilter.skipped_bytes += within.map_or(src.len(), |range| range.end_byte - range.start_byte);
+        stats.prefilter.rejected_groups += rejected;
+        return Ok(());
+      }
+      if mode == LiteralPrefilter::FilesAndGroups {
+        stats.prefilter.rejected_groups += rejected;
+        rejected
+      } else {
+        0
+      }
+    } else {
+      0
+    };
     let t0 = clock();
     let mut parsed_fast = false;
     if self.options.parser == ParserKind::Fast && within.is_none() {
@@ -296,8 +364,6 @@ impl<'a> Scanner<'a> {
     }
     lap(&mut stats.phase_nanos[1], t1);
     let t2 = clock();
-    stats.files += 1;
-    stats.bytes += src.len();
     let suppressions = if memchr::memmem::find(src.as_bytes(), IGNORE_TEXT.as_bytes()).is_some() {
       self.newlines.clear();
       self.newlines.extend(memchr::memchr_iter(b'\n', src.as_bytes()).map(|i| i as u32));
@@ -311,13 +377,22 @@ impl<'a> Scanner<'a> {
     };
 
     let t = &self.tree;
+    let regexes = if self.options.optimizations.worker_local_regex && !unit.regexes.is_empty() {
+      self.local_regexes[unit_idx].get_or_insert_with(|| unit.regexes.clone()).as_slice()
+    } else {
+      &unit.regexes
+    };
+    let rejected = if rejected_groups == 0 { None } else { Some(self.prefilter.rejected()) };
     let span = |n: u32| -> Span { (t.start[n as usize], t.end[n as usize]) };
     for n in 0..t.len() as u32 {
       let Some(groups) = unit.kind_map.get(t.kind[n as usize] as usize) else { continue };
       for &g in groups {
+        if rejected.is_some_and(|mask| mask[g as usize]) {
+          continue;
+        }
         let group = &unit.groups[g as usize];
         self.env.clear();
-        let m = Matcher { t, src, utils: &group.core.utils };
+        let m = Matcher { t, src, utils: &group.core.utils, regexes };
         let Some(node) = m.match_core(&group.core, n, &mut self.env) else { continue };
         let (env, f) = (&self.env, &mut self.found);
         f.clear();

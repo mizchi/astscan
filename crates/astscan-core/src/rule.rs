@@ -272,7 +272,7 @@ impl NthChild {
 pub enum Rule {
   Pattern(Pattern),
   Kind(u16),
-  Regex(regex::Regex),
+  Regex(usize),
   NthChild(Box<NthChild>),
   Inside(Box<Relation>),
   Has(Box<Relation>),
@@ -313,6 +313,7 @@ impl Interner {
 struct Compiler<'a> {
   lang: &'a Lang,
   vars: &'a mut Interner,
+  regexes: &'a mut Vec<regex::Regex>,
   util_ids: HashMap<String, u32>,
 }
 
@@ -417,7 +418,8 @@ impl Compiler<'_> {
     }
     if let Some(r) = get("regex") {
       let re = regex::Regex::new(as_str(r, "regex")?).map_err(|e| format!("Rule contains invalid regex matcher: {e}"))?;
-      rules.push(Rule::Regex(re));
+      rules.push(Rule::Regex(self.regexes.len()));
+      self.regexes.push(re);
     }
     if let Some(n) = get("nthChild") {
       rules.push(Rule::NthChild(Box::new(self.nth_child(n)?)));
@@ -608,6 +610,7 @@ pub fn compile_core(
   utils: Option<&Value>,
   lang: &Lang,
   vars: &mut Interner,
+  regexes: &mut Vec<regex::Regex>,
 ) -> Result<RuleCore, String> {
   let mut util_names: Vec<(&str, &Value)> = Vec::new();
   if let Some(utils) = utils.filter(|v| !v.is_null()) {
@@ -617,7 +620,7 @@ pub fn compile_core(
     }
   }
   let util_ids = util_names.iter().enumerate().map(|(i, (n, _))| (n.to_string(), i as u32)).collect();
-  let mut c = Compiler { lang, vars, util_ids };
+  let mut c = Compiler { lang, vars, regexes, util_ids };
 
   let mut compiled_utils = Vec::with_capacity(util_names.len());
   for (name, v) in &util_names {

@@ -120,6 +120,12 @@ Where the time went, and what was done about it:
 What is left is tree-sitter: in `slim` mode 73% to 85% of CPU time is inside
 `ts_parser_parse`. `--stats` prints the split per run.
 
+`ASTSCAN_LITERAL_PREFILTER` accepts `files` (default), `1` (files and
+individual rule groups), or `0` (off). File checks run when each applicable
+group has a provable necessary literal. `ASTSCAN_WORKER_LOCAL_REGEX=1`
+gives each worker its own regex scratch space. With `--stats`, the prefilter
+reports parser calls and bytes skipped, rule groups rejected, and CPU time.
+
 ### `--parser=fast` (experimental)
 
 A compiled tree-sitter grammar is parse tables, a lex function and sometimes

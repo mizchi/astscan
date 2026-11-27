@@ -5,7 +5,7 @@ mod scan;
 mod simd;
 
 use astscan_core::internals::{HTML, INJECTABLE, ScanOptions, Target, plan_rules};
-use astscan_core::{ParserKind, Registry, load_sgconfig};
+use astscan_core::{LiteralPrefilter, ParserKind, Registry, ScanOptimizations, load_sgconfig};
 use cache::{Cache, ruleset_key};
 use ignore::WalkState;
 use ignore::types::TypesBuilder;
@@ -256,6 +256,7 @@ fn run() -> Result<ExitCode, String> {
     Some(dir) => Some(Cache::open(dir, cache_key(&args, &registry)?)),
     None => None,
   };
+  let defaults = ScanOptimizations::default();
   let shared = Shared {
     rules: compiled,
     mode: args.mode,
@@ -268,9 +269,26 @@ fn run() -> Result<ExitCode, String> {
       parser: if args.fast_parser { ParserKind::Fast } else { ParserKind::TreeSitter },
       check_flatten: std::env::var_os("ASTSCAN_CHECK_FLATTEN").is_some(),
       timed: args.stats,
+      optimizations: ScanOptimizations {
+        literal_prefilter: match std::env::var("ASTSCAN_LITERAL_PREFILTER").as_deref() {
+          Ok("0") => LiteralPrefilter::Off,
+          Ok("files") => LiteralPrefilter::Files,
+          Ok("1") => LiteralPrefilter::FilesAndGroups,
+          _ => defaults.literal_prefilter,
+        },
+        worker_local_regex: match std::env::var("ASTSCAN_WORKER_LOCAL_REGEX").as_deref() {
+          Ok("0") => false,
+          Ok("1") => true,
+          _ => defaults.worker_local_regex,
+        },
+      },
     },
     fast_parsed: Default::default(),
     phase_nanos: Default::default(),
+    skipped_parses: Default::default(),
+    skipped_bytes: Default::default(),
+    rejected_groups: Default::default(),
+    prefilter_nanos: Default::default(),
     slow: args.stats.then(Default::default),
   };
   // List first, scan second: with the whole list in hand the largest files
@@ -350,6 +368,17 @@ fn run() -> Result<ExitCode, String> {
     );
     let ms = |i: usize| shared.phase_nanos[i].load(Ordering::Relaxed) as f64 / 1e6;
     eprintln!("astscan:   cpu: parse {:.1}ms, flatten {:.1}ms, match+write {:.1}ms", ms(0), ms(1), ms(2));
+    let prefilter_nanos = shared.prefilter_nanos.load(Ordering::Relaxed);
+    let rejected_groups = shared.rejected_groups.load(Ordering::Relaxed);
+    if prefilter_nanos > 0 || rejected_groups > 0 {
+      eprintln!(
+        "astscan:   prefilter: {} parses skipped ({} bytes), {} groups rejected, {:.1}ms cpu",
+        shared.skipped_parses.load(Ordering::Relaxed),
+        shared.skipped_bytes.load(Ordering::Relaxed),
+        rejected_groups,
+        prefilter_nanos as f64 * 1e-6,
+      );
+    }
     if args.fast_parser {
       let (back, own) = (shared.fast_parsed[0].load(Ordering::Relaxed), shared.fast_parsed[1].load(Ordering::Relaxed));
       eprintln!("astscan:   fast parser: {own} files, {back} handed back to tree-sitter");
