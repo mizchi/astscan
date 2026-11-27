@@ -2,8 +2,11 @@
 name = "astscan"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 description = "Fast multi-rule structural code search, compatible with ast-grep rule files (extraction only)"
 license = "MIT"
+repository = "https://github.com/mizchi/astscan"
+include = ["/src/**", "/tests/**", "/README.md", "/LICENSE"]
 
 [workspace]
 members = ["crates/astscan-core", "experiments"]

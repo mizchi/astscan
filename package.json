@@ -1,6 +1,8 @@
 {
   "name": "astscan-dev",
   "private": true,
+  "license": "MIT",
+  "packageManager": "pnpm@12.23.0",
   "description": "Development tooling for astscan (the secret scan run before a push)",
   "devDependencies": {
     "@secretlint/secretlint-rule-preset-recommend": "^9",

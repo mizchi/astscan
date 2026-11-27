@@ -2,8 +2,11 @@
 name = "astscan-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.90"
 description = "Fast multi-rule structural code search with ast-grep rules"
 license = "MIT"
+repository = "https://github.com/mizchi/astscan"
+include = ["/src/**", "/tests/**", "/csrc/**", "/build.rs", "/README.md", "/LICENSE"]
 
 [features]
 # Low-level interfaces for the companion CLI and parser experiments.
