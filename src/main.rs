@@ -1,10 +1,16 @@
-use astscan::cache::{Cache, ruleset_key};
-use astscan::config::{RuleSet, load_sgconfig, plan_rules};
-use astscan::lang::{HTML, INJECTABLE, Registry};
-use astscan::output::Mode;
-use astscan::scan::{Shared, Target, Worker};
+mod cache;
+mod output;
+mod record;
+mod scan;
+mod simd;
+
+use astscan_core::internals::{HTML, INJECTABLE, ScanOptions, Target, plan_rules};
+use astscan_core::{ParserKind, Registry, load_sgconfig};
+use cache::{Cache, ruleset_key};
 use ignore::WalkState;
 use ignore::types::TypesBuilder;
+use output::Mode;
+use scan::{Compiled, Shared, Worker};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -194,21 +200,28 @@ fn run() -> Result<ExitCode, String> {
   }
   let mut registry = Registry::default();
   if let Some(config) = &args.config {
-    load_sgconfig(config, &mut registry)?;
+    // SAFETY: --config selects a trusted local file and its native grammars.
+    unsafe { load_sgconfig(config, &mut registry) }?;
   }
   let plan = plan_rules(&args.rule, &mut registry)?;
   let loaded = started.elapsed();
-  if plan.langs.is_empty() {
+  if plan.languages().is_empty() {
     return Ok(ExitCode::SUCCESS);
   }
   // Compiling the rules is the slow half of loading and nothing below needs
   // its result until a file has to be scanned, so it runs beside the walk.
   // A run answered wholly from the cache only ever waits for it at the end.
-  let langs = plan.langs.clone();
+  let langs = plan.languages().to_vec();
   let unit_for = |name: &str| langs.iter().position(|l| l.name == name);
-  let compiled: &'static OnceLock<Result<RuleSet, String>> = Box::leak(Box::new(OnceLock::new()));
+  let compiled: &'static OnceLock<Result<Compiled, String>> = Box::leak(Box::new(OnceLock::new()));
   let compiling = std::thread::Builder::new().stack_size(COMPILER_STACK).spawn(move || {
-    let _ = compiled.set(plan.compile());
+    let result = plan.compile().map(|rules| {
+      for warning in rules.warnings() {
+        eprintln!("{warning}");
+      }
+      Compiled::new(rules)
+    });
+    let _ = compiled.set(result);
   });
   if let Err(e) = compiling {
     return Err(format!("cannot start the rule compiler thread: {e}"));
@@ -223,7 +236,7 @@ fn run() -> Result<ExitCode, String> {
   }
   // ast-grep scans the scripts and styles embedded in HTML with the rules of
   // their language, so HTML is walked whenever such a language has rules.
-  let html_exts: Vec<String> = registry.resolve(HTML).map(|l| l.exts.clone()).unwrap_or_default();
+  let html_exts: Vec<String> = registry.grammar(HTML).map(|l| l.exts.clone()).unwrap_or_default();
   let scan_html =
     unit_for(HTML).is_some() || INJECTABLE.iter().any(|alias| Registry::builtin_name(alias).is_some_and(|name| unit_for(name).is_some()));
   if scan_html {
@@ -244,7 +257,6 @@ fn run() -> Result<ExitCode, String> {
     None => None,
   };
   let shared = Shared {
-    langs: &langs,
     rules: compiled,
     mode: args.mode,
     cache: cache.as_ref(),
@@ -252,9 +264,12 @@ fn run() -> Result<ExitCode, String> {
     match_count: AtomicUsize::new(0),
     file_count: AtomicUsize::new(0),
     byte_count: AtomicUsize::new(0),
-    fast_parser: args.fast_parser,
+    options: ScanOptions {
+      parser: if args.fast_parser { ParserKind::Fast } else { ParserKind::TreeSitter },
+      check_flatten: std::env::var_os("ASTSCAN_CHECK_FLATTEN").is_some(),
+      timed: args.stats,
+    },
     fast_parsed: Default::default(),
-    check_flatten: std::env::var_os("ASTSCAN_CHECK_FLATTEN").is_some(),
     phase_nanos: Default::default(),
     slow: args.stats.then(Default::default),
   };
@@ -273,7 +288,7 @@ fn run() -> Result<ExitCode, String> {
       let path = entry.path();
       let target = match registry.name_for_path(path) {
         Some(HTML) => scan_html.then_some(Target::Html),
-        Some(name) => shared_ref.unit_for(name).map(Target::Unit),
+        Some(name) => unit_for(name).map(Target::Unit),
         None => None,
       };
       if let Some(target) = target {
@@ -323,8 +338,8 @@ fn run() -> Result<ExitCode, String> {
   if args.stats {
     eprintln!(
       "astscan: {} rules in {} groups, {} files, {} bytes, {} matches, load {:.1}ms, walk {:.1}ms, total {:.1}ms, {} threads",
-      rules.rule_count,
-      rules.units.iter().map(|u| u.groups.len()).sum::<usize>(),
+      rules.rules.rule_count(),
+      rules.group_count(),
       shared.file_count.load(Ordering::Relaxed),
       shared.byte_count.load(Ordering::Relaxed),
       shared.match_count.load(Ordering::Relaxed),

@@ -1,92 +1,108 @@
-//! One file: parse, flatten, run every rule of its grammar in a single pass,
-//! and serialise the matches.
-//!
-//! A `Worker` belongs to one thread and owns everything that is reused from
-//! file to file: the parsers, the flat tree's arrays, the environment and the
-//! output buffer. Scanning a file allocates only when a buffer has to grow.
+//! File I/O, cache replay and JSON output for CLI workers.
 
 use crate::cache::{Cache, Codec, file_key};
-use crate::config::{Group, RuleSet, Unit};
-use crate::eval::{Env, Matcher};
-use crate::fastparse::Parser as FastParser;
-use crate::lang::{HTML, HtmlInjections, INJECTABLE, Lang, Registry};
 use crate::output::{LineIndex, Mode, write_json_str, write_lines, write_range};
 use crate::record::{Found, Item, Reader, Span, write_found, write_unit};
-use crate::tree::{FlatTree, NONE};
-use std::collections::{HashMap, HashSet};
+use astscan_core::internals::{ScanOptions, Target};
+use astscan_core::{RuleSet, ScanError, Scanner, Severity};
 use std::io::Write;
+use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use tree_sitter::Parser;
 
 const MAX_FILE_SIZE: usize = 3_000_000;
 const MAX_LINE_COUNT: usize = 200_000;
-const IGNORE_TEXT: &str = "ast-grep-ignore";
 /// Output is handed to stdout once a worker holds this much.
 const FLUSH_AT: usize = 1 << 18;
 /// Cache records are handed to the cache file once a worker holds this much.
 const STORE_AT: usize = 1 << 22;
 
+pub struct Compiled {
+  pub rules: RuleSet,
+  output: Vec<OutputUnit>,
+}
+
+struct OutputUnit {
+  language: String,
+  groups: Vec<Vec<JsonRule>>,
+  var_keys: Vec<Vec<u8>>,
+}
+
+struct JsonRule {
+  id_json: Vec<u8>,
+  tail: Vec<u8>,
+  is_error: bool,
+}
+
+impl Compiled {
+  pub fn new(rules: RuleSet) -> Self {
+    let output = rules
+      .units()
+      .iter()
+      .map(|unit| {
+        let groups = unit
+          .groups()
+          .map(|metas| {
+            metas
+              .iter()
+              .map(|meta| {
+                let mut id_json = Vec::new();
+                write_json_str(&mut id_json, meta.id.as_bytes());
+                let mut tail = b",\"ruleId\":".to_vec();
+                tail.extend_from_slice(&id_json);
+                tail.extend_from_slice(format!(",\"severity\":\"{}\",\"note\":", meta.severity.as_str()).as_bytes());
+                match &meta.note {
+                  Some(note) => write_json_str(&mut tail, note.as_bytes()),
+                  None => tail.extend_from_slice(b"null"),
+                }
+                tail.extend_from_slice(b",\"message\":");
+                write_json_str(&mut tail, meta.message.as_bytes());
+                JsonRule { id_json, tail, is_error: meta.severity == Severity::Error }
+              })
+              .collect()
+          })
+          .collect();
+        let var_keys = unit
+          .variables()
+          .iter()
+          .map(|name| {
+            let mut key = Vec::new();
+            write_json_str(&mut key, name.as_bytes());
+            key.push(b':');
+            key
+          })
+          .collect();
+        OutputUnit { language: unit.language().to_string(), groups, var_keys }
+      })
+      .collect();
+    Self { rules, output }
+  }
+
+  pub fn group_count(&self) -> usize {
+    self.output.iter().map(|unit| unit.groups.len()).sum()
+  }
+}
+
 pub struct Shared<'a> {
-  /// The grammar of each unit; known before the rules are compiled.
-  pub langs: &'a [Arc<Lang>],
-  /// The compiled rules, set by whoever compiles them. A file answered
-  /// from the cache never waits for this.
-  pub rules: &'a OnceLock<Result<RuleSet, String>>,
+  /// Set by the background rule compiler.
+  pub rules: &'a OnceLock<Result<Compiled, String>>,
   pub mode: Mode,
-  /// Results of earlier runs, by file content.
   pub cache: Option<&'a Cache>,
   pub error_matches: AtomicUsize,
   pub match_count: AtomicUsize,
   pub file_count: AtomicUsize,
   pub byte_count: AtomicUsize,
-  /// Parse with `fastparse` and fall back to tree-sitter where it gives up.
-  pub fast_parser: bool,
-  /// Files `fastparse` handed back, and files it parsed.
+  pub options: ScanOptions,
   pub fast_parsed: [AtomicUsize; 2],
-  /// Compare the direct flattening with the cursor one on every file.
-  pub check_flatten: bool,
-  /// Nanoseconds spent parsing, flattening, and matching plus writing.
   pub phase_nanos: [AtomicUsize; 3],
-  /// Slowest files as `(micros, path)`, kept only under `--stats`.
   pub slow: Option<std::sync::Mutex<Vec<(u128, String)>>>,
 }
 
 impl<'a> Shared<'a> {
-  pub fn unit_for(&self, lang_name: &str) -> Option<usize> {
-    self.langs.iter().position(|l| l.name == lang_name)
-  }
-
-  /// The compiled rules, waiting for them if need be. `None` when they did not compile.
-  pub fn compiled(&self) -> Option<&'a RuleSet> {
+  /// The compiled rules, waiting for them if need be. `None` if compilation failed.
+  fn compiled(&self) -> Option<&'a Compiled> {
     self.rules.wait().as_ref().ok()
   }
-}
-
-/// `// ast-grep-ignore` comments of one file. `None` as a rule set means every rule.
-#[derive(Default)]
-struct Suppressions {
-  file: Option<Option<HashSet<String>>>,
-  lines: HashMap<usize, Option<HashSet<String>>>,
-}
-
-impl Suppressions {
-  fn covers(set: &Option<HashSet<String>>, id: &str) -> bool {
-    set.as_ref().is_none_or(|s| s.contains(id))
-  }
-  fn suppressed(&self, line: usize, id: &str) -> bool {
-    self.file.as_ref().is_some_and(|s| Self::covers(s, id)) || self.lines.get(&line).is_some_and(|s| Self::covers(s, id))
-  }
-}
-
-fn parse_suppression_set(text: &str) -> Option<HashSet<String>> {
-  let (_, after) = text.trim().split_once(IGNORE_TEXT)?;
-  let after = after.trim();
-  if after.is_empty() {
-    return None;
-  }
-  let (_, rules) = after.split_once(':')?;
-  Some(rules.split(',').filter_map(|r| r.trim_start().split(' ').next()).map(str::to_string).collect())
 }
 
 fn flush(out: &mut Vec<u8>) {
@@ -101,24 +117,9 @@ fn flush(out: &mut Vec<u8>) {
   out.clear();
 }
 
-/// What a listed file is scanned as.
-#[derive(Clone, Copy)]
-pub enum Target {
-  /// A file of the grammar of `RuleSet::units[i]`.
-  Unit(usize),
-  /// An HTML document: scanned as HTML when HTML rules exist, and once per
-  /// embedded script or style for the rules of that language.
-  Html,
-}
-
 pub struct Worker<'a> {
   shared: &'a Shared<'a>,
-  html: Option<HtmlInjections>,
-  parsers: Vec<Option<Parser>>,
-  /// Outer `None`: not tried yet. Inner `None`: a grammar the driver cannot read.
-  fast_parsers: Vec<Option<Option<FastParser>>>,
-  tree: FlatTree,
-  env: Env,
+  scanner: Option<Scanner<'a>>,
   lines: LineIndex,
   out: Vec<u8>,
   head: Vec<u8>,
@@ -127,10 +128,9 @@ pub struct Worker<'a> {
   /// Matches and error-severity matches of the file being scanned.
   matched: usize,
   errors: usize,
-  /// The match being written, as byte ranges.
+  /// Reusable match storage for cache replay.
   found: Found,
-  /// Whether the file being scanned goes into the cache, and its matches so far, encoded.
-  recording: bool,
+  /// Encoded matches of the file being scanned.
   entry: Vec<u8>,
   /// A cached entry, decompressed.
   payload: Vec<u8>,
@@ -142,11 +142,7 @@ impl<'a> Worker<'a> {
   pub fn new(shared: &'a Shared<'a>) -> Self {
     Worker {
       shared,
-      html: None,
-      parsers: shared.langs.iter().map(|_| None).collect(),
-      fast_parsers: shared.langs.iter().map(|_| None).collect(),
-      tree: FlatTree::default(),
-      env: Env::default(),
+      scanner: None,
       lines: LineIndex::default(),
       out: Vec::with_capacity(FLUSH_AT * 2),
       head: Vec::new(),
@@ -155,7 +151,6 @@ impl<'a> Worker<'a> {
       matched: 0,
       errors: 0,
       found: Found::default(),
-      recording: false,
       entry: Vec::new(),
       payload: Vec::new(),
       records: Vec::new(),
@@ -167,7 +162,7 @@ impl<'a> Worker<'a> {
     flush(&mut self.out);
   }
 
-  pub fn scan_file(&mut self, path: &std::path::Path, target: Target) {
+  pub fn scan_file(&mut self, path: &Path, target: Target) {
     let mut src = std::mem::take(&mut self.src);
     src.clear();
     let read = std::fs::File::open(path).and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut src));
@@ -181,7 +176,7 @@ impl<'a> Worker<'a> {
   }
 
   /// Answer from the cache when the file is known, scan it and remember the answer when not.
-  fn scan_bytes(&mut self, src: &[u8], path: &std::path::Path, target: Target) {
+  fn scan_bytes(&mut self, src: &[u8], path: &Path, target: Target) {
     let shared = self.shared;
     let display = path.to_string_lossy();
     // `ignore` yields `./a/b` for the root `.`; ast-grep reports `a/b`.
@@ -209,23 +204,19 @@ impl<'a> Worker<'a> {
       }
     }
     // Rules that did not compile have no answer to give, and none to remember.
-    if shared.compiled().is_none() {
-      return;
-    }
+    let Some(compiled) = shared.compiled() else { return };
     if let Some((cache, _)) = key {
       cache.misses.fetch_add(1, Ordering::Relaxed);
-      self.recording = true;
       self.entry.clear();
     }
-    self.scan_text(src, display, target);
+    let complete = self.scan_text(src, display, target, compiled, key.is_some());
     if self.matched > 0 {
       shared.match_count.fetch_add(self.matched, Ordering::Relaxed);
     }
     if self.errors > 0 {
       shared.error_matches.fetch_add(self.errors, Ordering::Relaxed);
     }
-    if let Some((cache, key)) = key {
-      self.recording = false;
+    if complete && let Some((cache, key)) = key {
       self.codec.write_record(&mut self.records, key, self.matched as u32, self.errors as u32, &self.entry);
       if self.records.len() >= STORE_AT {
         cache.append(&mut self.records);
@@ -238,24 +229,24 @@ impl<'a> Worker<'a> {
   /// these rules and this file: the file is then scanned as if never seen.
   fn replay(&mut self, payload: &[u8], src: &[u8], path: &str) -> bool {
     let shared = self.shared;
-    let Some(rules) = shared.compiled() else { return false };
+    let Some(compiled) = shared.compiled() else { return false };
     if payload.is_empty() {
       return true;
     }
     // Once over everything before a byte is written: output cannot be taken back.
     let mut reader = Reader::new(payload);
-    let mut unit: Option<&Unit> = None;
+    let mut unit: Option<&OutputUnit> = None;
     loop {
       match reader.next(&mut self.found) {
         Err(_) => return false,
         Ok(None) => break,
-        Ok(Some(Item::Unit(u))) => unit = rules.units.get(u as usize),
+        Ok(Some(Item::Unit(u))) => unit = compiled.output.get(u as usize),
         Ok(Some(Item::Found)) => {
           let f = &self.found;
           let Some(group) = unit.and_then(|u| u.groups.get(f.group as usize)) else { return false };
           let vars = f.single.iter().map(|(v, _)| v).chain(f.multi.iter().map(|(v, _, _)| v));
           if f.extent().is_none_or(|end| end as usize > src.len())
-            || f.dead.iter().any(|&i| i as usize >= group.metas.len())
+            || f.dead.iter().any(|&i| i as usize >= group.len())
             || vars.into_iter().any(|&v| v as usize >= unit.map_or(0, |u| u.var_keys.len()))
           {
             return false;
@@ -269,10 +260,10 @@ impl<'a> Worker<'a> {
 
     self.lines.build(src);
     let mut reader = Reader::new(payload);
-    let mut unit = &rules.units[0];
+    let mut unit = &compiled.output[0];
     while let Ok(Some(item)) = reader.next(&mut self.found) {
       match item {
-        Item::Unit(u) => unit = &rules.units[u as usize],
+        Item::Unit(u) => unit = &compiled.output[u as usize],
         Item::Found => {
           let mut e = Emit {
             out: &mut self.out,
@@ -297,33 +288,78 @@ impl<'a> Worker<'a> {
     true
   }
 
-  fn scan_text(&mut self, src: &[u8], display: &str, target: Target) {
+  fn scan_text(&mut self, src: &[u8], display: &str, target: Target, compiled: &'a Compiled, recording: bool) -> bool {
     // A file that is not UTF-8 is skipped, as is one both huge and long.
-    let Ok(text) = simdutf8::basic::from_utf8(src) else { return };
+    let Ok(text) = simdutf8::basic::from_utf8(src) else { return true };
     if text.len() > MAX_FILE_SIZE && text.lines().count() > MAX_LINE_COUNT {
-      return;
+      return true;
     }
-    let started = self.shared.slow.as_ref().map(|_| std::time::Instant::now());
-    match target {
-      Target::Unit(unit_idx) => self.scan_source(text, display, unit_idx, None),
-      Target::Html => {
-        if let Some(unit_idx) = self.shared.unit_for(HTML) {
-          self.scan_source(text, display, unit_idx, None);
+
+    let shared = self.shared;
+    let scanner = self.scanner.get_or_insert_with(|| Scanner::with_options(&compiled.rules, shared.options));
+    let started = shared.slow.as_ref().map(|_| std::time::Instant::now());
+    let mut lines_built = false;
+    let mut recorded_unit = None;
+    let stats = scanner.scan_target(text, target, |idx, found| {
+      if !lines_built {
+        self.lines.build(src);
+        lines_built = true;
+      }
+      if recording {
+        if recorded_unit != Some(idx) {
+          recorded_unit = Some(idx);
+          write_unit(&mut self.entry, idx as u32);
         }
-        let injections = self.html.get_or_insert_with(HtmlInjections::default).extract(text);
-        for (lang, range) in injections {
-          let unit = INJECTABLE
-            .contains(&lang.as_str())
-            .then(|| Registry::builtin_name(&lang))
-            .flatten()
-            .and_then(|name| self.shared.unit_for(name));
-          if let Some(unit_idx) = unit {
-            self.scan_source(text, display, unit_idx, Some(range));
+        write_found(&mut self.entry, found);
+      }
+      let unit = &compiled.output[idx];
+      let mut e = Emit {
+        out: &mut self.out,
+        head: &mut self.head,
+        text: &mut self.text,
+        lines: &self.lines,
+        src,
+        path: display,
+        mode: shared.mode,
+        unit,
+        keys: &unit.var_keys,
+      };
+      let (count, errors) = emit(&mut e, &unit.groups[found.group as usize], found);
+      self.matched += count;
+      self.errors += errors;
+      if self.out.len() >= FLUSH_AT {
+        flush(&mut self.out);
+      }
+    });
+    match stats {
+      Ok(stats) => {
+        shared.file_count.fetch_add(stats.files, Ordering::Relaxed);
+        shared.byte_count.fetch_add(stats.bytes, Ordering::Relaxed);
+        if shared.options.timed {
+          for (total, elapsed) in shared.phase_nanos.iter().zip(stats.phase_nanos) {
+            total.fetch_add(elapsed, Ordering::Relaxed);
+          }
+        }
+        if shared.options.parser == astscan_core::ParserKind::Fast {
+          for (total, count) in shared.fast_parsed.iter().zip(stats.fast_parsed) {
+            total.fetch_add(count, Ordering::Relaxed);
           }
         }
       }
+      Err(ScanError::FastParserMismatch(diff)) => {
+        eprintln!("astscan: fast parser mismatch in {display}: {diff}");
+        std::process::exit(3);
+      }
+      Err(ScanError::FlattenMismatch(diff)) => {
+        eprintln!("astscan: flatten mismatch in {display}: {diff}");
+        std::process::exit(3);
+      }
+      Err(ScanError::ParseFailed | ScanError::SourceTooLarge) => {
+        // A scan that did not finish must not be served by the cache.
+        return false;
+      }
     }
-    if let (Some(slow), Some(started)) = (&self.shared.slow, started) {
+    if let (Some(slow), Some(started)) = (&shared.slow, started) {
       let mut slow = slow.lock().expect("no panic while holding the lock");
       slow.push((started.elapsed().as_micros(), display.to_string()));
       if slow.len() > 64 {
@@ -331,182 +367,7 @@ impl<'a> Worker<'a> {
         slow.truncate(8);
       }
     }
-  }
-
-  /// `within` restricts parsing to one range of `src`: a script inside HTML.
-  pub fn scan_source(&mut self, src: &str, path: &str, unit_idx: usize, within: Option<tree_sitter::Range>) {
-    let shared = self.shared;
-    let Some(rules) = shared.compiled() else { return };
-    let unit: &Unit = &rules.units[unit_idx];
-    let timed = shared.slow.is_some();
-    let clock = |on: bool| on.then(std::time::Instant::now);
-    let lap = |phase: usize, since: Option<std::time::Instant>| {
-      if let Some(t) = since {
-        shared.phase_nanos[phase].fetch_add(t.elapsed().as_nanos() as usize, Ordering::Relaxed);
-      }
-    };
-    let t0 = clock(timed);
-    // The driver of our own first; whatever it hands back goes to tree-sitter.
-    let mut parsed_fast = false;
-    if shared.fast_parser && within.is_none() {
-      let fast = self.fast_parsers[unit_idx].get_or_insert_with(|| FastParser::new(&unit.lang.ts).ok());
-      if let Some(fast) = fast {
-        parsed_fast = fast.parse(src, &mut self.tree).is_ok();
-      }
-      shared.fast_parsed[parsed_fast as usize].fetch_add(1, Ordering::Relaxed);
-    }
-    if parsed_fast && !shared.check_flatten {
-      lap(0, t0);
-    }
-    let t1 = clock(timed);
-    if !parsed_fast || shared.check_flatten {
-      let parser = self.parsers[unit_idx].get_or_insert_with(|| {
-        let mut p = Parser::new();
-        p.set_language(&unit.lang.ts).expect("the grammar loaded, so its version is compatible");
-        p
-      });
-      let parsed = match within {
-        None => parser.parse(src.as_bytes(), None),
-        Some(range) => {
-          if parser.set_included_ranges(&[range]).is_err() {
-            return;
-          }
-          let tree = parser.parse(src.as_bytes(), None);
-          parser.set_included_ranges(&[]).expect("an empty range list is always valid");
-          tree
-        }
-      };
-      let Some(ts_tree) = parsed else { return };
-      if shared.check_flatten {
-        // Three routes to one tree: the cursor is the reference for both others.
-        let mut reference = FlatTree::default();
-        reference.build_with_cursor(&ts_tree);
-        if parsed_fast && let Some(diff) = crate::tree::first_difference(&self.tree, &reference) {
-          eprintln!("astscan: fast parser mismatch in {path}: {diff}");
-          std::process::exit(3);
-        }
-        self.tree.build(ts_tree);
-        if let Some(diff) = crate::tree::first_difference(&self.tree, &reference) {
-          eprintln!("astscan: flatten mismatch in {path}: {diff}");
-          std::process::exit(3);
-        }
-      } else {
-        lap(0, t0);
-        self.tree.build(ts_tree);
-      }
-    }
-    lap(1, t1);
-    let t2 = clock(timed);
-    shared.file_count.fetch_add(1, Ordering::Relaxed);
-    shared.byte_count.fetch_add(src.len(), Ordering::Relaxed);
-
-    let bytes = src.as_bytes();
-    let mut lines_built = false;
-    let mut unit_written = false;
-    let suppressions = if memchr::memmem::find(bytes, IGNORE_TEXT.as_bytes()).is_some() {
-      self.lines.build(bytes);
-      lines_built = true;
-      match self.collect_suppressions(src, unit) {
-        Some(s) => Some(s),
-        // A bare file-level `ast-grep-ignore` silences the whole file.
-        None => return,
-      }
-    } else {
-      None
-    };
-
-    let t = &self.tree;
-    let mut matched = 0usize;
-    let mut errors = 0usize;
-    let span = |n: u32| -> Span { (t.start[n as usize], t.end[n as usize]) };
-    for n in 0..t.len() as u32 {
-      let Some(groups) = unit.kind_map.get(t.kind[n as usize] as usize) else { continue };
-      for &g in groups {
-        let group: &Group = &unit.groups[g as usize];
-        self.env.clear();
-        let m = Matcher { t, src, utils: &group.core.utils };
-        let Some(node) = m.match_core(&group.core, n, &mut self.env) else { continue };
-        if !lines_built {
-          self.lines.build(bytes);
-          lines_built = true;
-        }
-        // The match as byte ranges: all that writing it, now or from the cache, needs.
-        let (env, f) = (&self.env, &mut self.found);
-        f.clear();
-        f.group = g;
-        (f.start, f.end) = span(node);
-        if let Some(suppressions) = &suppressions {
-          let line = self.lines.line(f.start);
-          f.dead.extend((0..group.metas.len() as u32).filter(|&i| suppressions.suppressed(line, &group.metas[i as usize].id)));
-          if f.dead.len() == group.metas.len() {
-            continue;
-          }
-        }
-        f.single.extend(env.single.iter().map(|&(var, n)| (var as u32, span(n))));
-        for &(var, first, count) in &env.multi {
-          f.multi.push((var as u32, f.pool.len() as u32, count));
-          f.pool.extend(env.pool[first as usize..(first + count) as usize].iter().map(|&n| span(n)));
-        }
-        f.labels.extend(env.labels.iter().map(|&n| span(n)));
-        if self.recording {
-          if !std::mem::replace(&mut unit_written, true) {
-            write_unit(&mut self.entry, unit_idx as u32);
-          }
-          write_found(&mut self.entry, f);
-        }
-        let mut e = Emit {
-          out: &mut self.out,
-          head: &mut self.head,
-          text: &mut self.text,
-          lines: &self.lines,
-          src: bytes,
-          path,
-          mode: shared.mode,
-          unit,
-          keys: &unit.var_keys,
-        };
-        let (count, errs) = emit(&mut e, group, f);
-        matched += count;
-        errors += errs;
-      }
-      // Every line in the buffer is complete, so it can leave at any node.
-      if self.out.len() >= FLUSH_AT {
-        flush(&mut self.out);
-      }
-    }
-    lap(2, t2);
-    self.matched += matched;
-    self.errors += errors;
-  }
-
-  /// `None` when the whole file is suppressed.
-  fn collect_suppressions(&self, src: &str, unit: &Unit) -> Option<Suppressions> {
-    let t = &self.tree;
-    let lines = &self.lines;
-    let mut sup = Suppressions::default();
-    for n in 0..t.len() as u32 {
-      if !unit.lang.comment_kind.get(t.kind[n as usize] as usize).copied().unwrap_or(false) {
-        continue;
-      }
-      let text = &src[t.start[n as usize] as usize..t.end[n as usize] as usize];
-      let Some(start) = text.find(|c: char| c.is_alphabetic()) else { continue };
-      if !text[start..].starts_with(IGNORE_TEXT) {
-        continue;
-      }
-      let line = lines.line(t.start[n as usize]);
-      let prev = t.prev[n as usize];
-      let prev_same_line = (prev != NONE && lines.line(t.end[prev as usize]) == line).then_some(prev);
-      let next = t.ts_next_sibling(n);
-      let set = parse_suppression_set(text);
-      if line == 0 && prev_same_line.is_none() && (next == NONE || lines.line(t.start[next as usize]) >= 2) {
-        set.as_ref()?;
-        sup.file = Some(set);
-        continue;
-      }
-      let key = prev_same_line.map_or(line + 1, |p| lines.line(t.start[p as usize]));
-      sup.lines.insert(key, set);
-    }
-    Some(sup)
+    true
   }
 }
 
@@ -527,7 +388,7 @@ struct Emit<'a, 'b> {
   src: &'b [u8],
   path: &'b str,
   mode: Mode,
-  unit: &'a Unit,
+  unit: &'a OutputUnit,
   /// Metavariable names as JSON object keys.
   keys: &'a [Vec<u8>],
 }
@@ -600,10 +461,10 @@ impl Emit<'_, '_> {
 
 /// Write one match under every rule of its group that is live here. Returns
 /// `(lines, error-severity lines)`.
-fn emit(e: &mut Emit, group: &Group, f: &Found) -> (usize, usize) {
+fn emit(e: &mut Emit, rules: &[JsonRule], f: &Found) -> (usize, usize) {
   let (start, end) = (f.start, f.end);
   let live = |i: usize| !f.dead.contains(&(i as u32));
-  let metas = || group.metas.iter().enumerate().filter(|(i, _)| live(*i)).map(|(_, m)| m);
+  let metas = || rules.iter().enumerate().filter(|(i, _)| live(*i)).map(|(_, m)| m);
   let mut count = 0;
   let mut errors = 0;
 
@@ -614,7 +475,7 @@ fn emit(e: &mut Emit, group: &Group, f: &Found) -> (usize, usize) {
       head.extend_from_slice(b"{\"file\":");
       write_json_str(&mut head, e.path.as_bytes());
       head.extend_from_slice(b",\"language\":");
-      write_json_str(&mut head, e.unit.lang.name.as_bytes());
+      write_json_str(&mut head, e.unit.language.as_bytes());
       head.extend_from_slice(b",\"range\":");
       write_range(&mut head, e.src, e.lines, start, end);
       e.meta_variables(&mut head, f, false);
@@ -648,7 +509,7 @@ fn emit(e: &mut Emit, group: &Group, f: &Found) -> (usize, usize) {
       write_json_str(&mut head, e.path.as_bytes());
       write_lines(&mut head, e.src, start, end);
       head.extend_from_slice(b",\"language\":");
-      write_json_str(&mut head, e.unit.lang.name.as_bytes());
+      write_json_str(&mut head, e.unit.language.as_bytes());
       e.meta_variables(&mut head, f, true);
       for meta in metas() {
         e.out.extend_from_slice(&head);

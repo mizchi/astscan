@@ -2,11 +2,16 @@ amends "package://pkg.pkl-lang.org/github.com/mizchi/pkfire/pkfire@0.12.3#/Taskf
 
 local sources: Listing<String> = new {
   "src/**/*.rs"
-  "csrc/**/*.c"
+  "crates/astscan-core/src/**/*.rs"
+  "crates/astscan-core/tests/**/*.rs"
+  "crates/astscan-core/csrc/**/*.c"
+  "crates/astscan-core/Cargo.toml"
+  "crates/astscan-core/README.md"
+  "crates/astscan-core/build.rs"
   "tests/**/*.rs"
-  "build.rs"
   "Cargo.toml"
   "Cargo.lock"
+  "rust-toolchain.toml"
 }
 
 local build: Task = new {
@@ -27,8 +32,13 @@ local test: Task = new {
 local lint: Task = new {
   name = "lint"
   description = "rustfmt check and clippy with warnings as errors"
-  cmd = "cargo fmt --check && cargo clippy --release --all-targets -- -D warnings"
-  inputs = sources
+  cmd = "cargo fmt --all --check && cargo clippy --workspace --release --all-targets -- -D warnings"
+  inputs {
+    ...sources
+    "rustfmt.toml"
+    "experiments/Cargo.toml"
+    "experiments/src/**/*.rs"
+  }
 }
 
 /// Compares every match with ast-grep's. Needs an ast-grep binary (AST_GREP)

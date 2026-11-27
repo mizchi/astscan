@@ -2,13 +2,12 @@
 //!
 //! For every file of one language under the given directories: parse with
 //! tree-sitter (plus the flattening astscan does today), parse with
-//! `astscan::fastparse`, and compare the two flat trees node for node.
+//! `astscan-core's fast parser`, and compare the two flat trees node for node.
 //!
-//!   cargo run --release --example fastparse_probe -- <Language> <dir>...
+//!   cargo run --release -p astscan-experiments --bin fastparse_probe -- <Language> <dir>...
 
-use astscan::fastparse::{Bail, Parser as FastParser};
-use astscan::lang::Registry;
-use astscan::tree::{FlatTree, first_difference};
+use astscan_core::Registry;
+use astscan_core::internals::{Bail, FastParser, FlatTree, first_difference};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,7 @@ fn main() {
   let lang_name = args.next().expect("usage: fastparse_probe <Language> <dir>...");
   let roots: Vec<PathBuf> = args.map(PathBuf::from).collect();
   let mut registry = Registry::default();
-  let lang = registry.resolve(&lang_name).expect("a built-in language");
+  let lang = registry.grammar(&lang_name).expect("a built-in language");
   let mut files = Vec::new();
   let mut walk = ignore::WalkBuilder::new(&roots[0]);
   roots[1..].iter().for_each(|r| {
@@ -30,8 +29,8 @@ fn main() {
   }
 
   let mut ts = tree_sitter::Parser::new();
-  ts.set_language(&lang.ts).unwrap();
-  let mut fast = FastParser::new(&lang.ts).expect("a grammar the driver reads");
+  ts.set_language(lang.builtin_language().expect("built-in grammar")).unwrap();
+  let mut fast = FastParser::new(lang.clone()).expect("a grammar the driver reads");
   let (mut reference, mut candidate) = (FlatTree::default(), FlatTree::default());
   let (mut ts_time, mut ts_time_on_ok, mut fast_time, mut fast_wasted) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
   let (mut total, mut ok, mut ambiguous, mut error, mut wrong) = (0usize, 0usize, 0usize, 0usize, 0usize);

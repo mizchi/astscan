@@ -2,13 +2,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tree_sitter::Language;
 
 pub struct Lang {
   /// Canonical name, as reported in output (`Jsx` resolves to `JavaScript`).
   pub name: String,
-  pub ts: Language,
+  pub(crate) ts: Language,
   /// What `$` becomes inside a pattern so the pattern parses as code.
   pub expando: char,
   pub meta: char,
@@ -16,14 +16,21 @@ pub struct Lang {
   /// Indexed by kind id: does the kind's name contain "comment"?
   pub comment_kind: Vec<bool>,
   pub nkinds: usize,
-  _lib: Option<libloading::Library>,
+  pub(crate) dense_table: OnceLock<Option<Box<[u16]>>>,
+  _library: Option<libloading::Library>,
 }
 
 impl Lang {
   fn new(name: &str, ts: Language, expando: char, meta: char, exts: Vec<String>, lib: Option<libloading::Library>) -> Self {
     let nkinds = ts.node_kind_count();
     let comment_kind = (0..nkinds).map(|i| ts.node_kind_for_id(i as u16).is_some_and(|k| k.contains("comment"))).collect();
-    Lang { name: name.to_string(), ts, expando, meta, exts, comment_kind, nkinds, _lib: lib }
+    Lang { name: name.to_string(), ts, expando, meta, exts, comment_kind, nkinds, dense_table: OnceLock::new(), _library: lib }
+  }
+
+  /// Experiments can pass built-in grammars to tree-sitter directly.
+  #[cfg(feature = "internals")]
+  pub fn builtin_language(&self) -> Option<&Language> {
+    self._library.is_none().then_some(&self.ts)
   }
 
   /// 0 means the grammar has no such kind.
@@ -172,7 +179,13 @@ pub struct Registry {
 }
 
 impl Registry {
-  pub fn register_custom(&mut self, decl: CustomDecl) -> Result<(), String> {
+  /// Load a custom grammar from a native library.
+  ///
+  /// # Safety
+  ///
+  /// The library must be trusted, and the symbol must name a compatible
+  /// tree-sitter grammar constructor.
+  pub unsafe fn register_custom(&mut self, decl: CustomDecl) -> Result<(), String> {
     let path = std::fs::canonicalize(&decl.library_path)
       .map_err(|e| format!("cannot get the absolute path of dynamic lib {}: {e}", decl.library_path.display()))?;
     // SAFETY: loading a tree-sitter grammar the user declared; the symbol is
@@ -196,7 +209,7 @@ impl Registry {
   }
 
   /// Built-in names and aliases are case-insensitive; a declared language is its exact name.
-  pub fn resolve(&mut self, name: &str) -> Option<Arc<Lang>> {
+  pub(crate) fn resolve(&mut self, name: &str) -> Option<Arc<Lang>> {
     for b in BUILTINS {
       if b.aliases.iter().any(|a| name.eq_ignore_ascii_case(a)) {
         let lang = self
@@ -207,6 +220,11 @@ impl Registry {
       }
     }
     self.custom.iter().find(|l| l.name == name).cloned()
+  }
+
+  #[cfg(feature = "internals")]
+  pub fn grammar(&mut self, name: &str) -> Option<Arc<Lang>> {
+    self.resolve(name)
   }
 
   /// The canonical name behind a built-in alias, without loading the grammar.
@@ -260,10 +278,20 @@ impl Default for HtmlInjections {
 }
 
 fn dfs<'t>(node: tree_sitter::Node<'t>, visit: &mut impl FnMut(tree_sitter::Node<'t>) -> bool) -> bool {
-  if visit(node) {
-    return true;
+  let mut cursor = node.walk();
+  loop {
+    if visit(cursor.node()) {
+      return true;
+    }
+    if cursor.goto_first_child() {
+      continue;
+    }
+    while !cursor.goto_next_sibling() {
+      if !cursor.goto_parent() {
+        return false;
+      }
+    }
   }
-  (0..node.child_count()).any(|i| dfs(node.child(i).expect("child index is in range"), visit))
 }
 
 fn find<'t>(node: tree_sitter::Node<'t>, kind: u16) -> Option<tree_sitter::Node<'t>> {

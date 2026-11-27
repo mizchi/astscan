@@ -23,6 +23,8 @@
 #define F_EXTRA 2
 #define F_MISSING 4
 #define F_NAMED_LEAF 8
+// Fall back to the iterative cursor before using a large caller stack.
+#define MAX_WALK_DEPTH 256
 
 typedef struct {
   uint16_t *kind;
@@ -35,8 +37,8 @@ typedef struct {
   uint16_t *field;
   uint32_t len;
   uint32_t cap;
-  // Set when the tree held more visible nodes than it declared; the caller
-  // then discards the result.
+  // Set when the walk exceeds its node or depth budget. The caller
+  // then uses the iterative cursor.
   uint32_t overflow;
 } AstscanFlat;
 
@@ -51,10 +53,15 @@ typedef struct {
   const TSLanguage *language;
 } Ctx;
 
-static void walk_children(Ctx *ctx, Subtree parent, uint32_t position, Frame *frame, TSFieldId inherited_field) {
+static void walk_children(Ctx *ctx, Subtree parent, uint32_t position, Frame *frame,
+                          TSFieldId inherited_field, uint32_t depth) {
   uint32_t child_count = ts_subtree_child_count(parent);
   if (child_count == 0) return;
   AstscanFlat *out = ctx->out;
+  if (depth == MAX_WALK_DEPTH) {
+    out->overflow = 1;
+    return;
+  }
   const TSLanguage *language = ctx->language;
   const TSSymbol *alias_sequence = ts_language_alias_sequence(language, parent.ptr->production_id);
   const TSFieldMapEntry *field_map, *field_map_end;
@@ -104,14 +111,14 @@ static void walk_children(Ctx *ctx, Subtree parent, uint32_t position, Frame *fr
       frame->has_named_child |= named;
 
       Frame own = {idx, NONE, false};
-      walk_children(ctx, child, position, &own, 0);
+      walk_children(ctx, child, position, &own, 0, depth + 1);
       if (out->overflow) return;
       if (!own.has_named_child) flags |= F_NAMED_LEAF;
       out->flags[idx] = flags;
       out->sub_end[idx] = out->len;
     } else if (ts_subtree_visible_child_count(child) > 0) {
       // A hidden node: its visible descendants are children of the node above.
-      walk_children(ctx, child, position, frame, field);
+      walk_children(ctx, child, position, frame, field, depth + 1);
       if (out->overflow) return;
     }
     position += size;
@@ -148,7 +155,7 @@ void astscan_flatten(const TSTree *tree, AstscanFlat *out) {
 
   Ctx ctx = {out, language};
   Frame frame = {0, NONE, false};
-  walk_children(&ctx, root, position, &frame, 0);
+  walk_children(&ctx, root, position, &frame, 0, 0);
   if (out->overflow) return;
   if (!frame.has_named_child) flags |= F_NAMED_LEAF;
   out->flags[0] = flags;
@@ -156,7 +163,7 @@ void astscan_flatten(const TSTree *tree, AstscanFlat *out) {
 }
 
 // The `log` slot of a TSLexer is variadic, which Rust cannot define. The
-// experimental parser in src/fastparse.rs points its lexer here.
+// experimental parser in astscan-core/src/fastparse.rs points its lexer here.
 void astscan_lexer_log(const TSLexer *lexer, const char *format, ...) {
   (void)lexer;
   (void)format;

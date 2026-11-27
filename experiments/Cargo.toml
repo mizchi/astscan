@@ -1,0 +1,13 @@
+[package]
+name = "astscan-experiments"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+astscan-core = { path = "../crates/astscan-core", features = ["internals"] }
+tree-sitter = "=0.27.0"
+ignore = "0.4"
+memchr = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }

@@ -80,6 +80,7 @@ impl FlatTree {
     self.kind.len()
   }
 
+  #[cfg(feature = "internals")]
   pub fn is_empty(&self) -> bool {
     self.kind.is_empty()
   }
@@ -220,7 +221,7 @@ impl FlatTree {
   pub fn is_named_leaf(&self, n: u32) -> bool {
     self.flags[n as usize] & F_NAMED_LEAF != 0
   }
-  #[inline]
+  #[cfg(feature = "internals")]
   pub fn is_leaf(&self, n: u32) -> bool {
     self.sub_end[n as usize] == n + 1
   }

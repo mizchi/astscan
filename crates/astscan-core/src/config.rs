@@ -10,45 +10,97 @@
 //! under every id in the group.
 
 use crate::lang::{CustomDecl, Lang, Registry};
-use crate::output::write_json_str;
 use crate::rule::{Interner, RuleCore, compile_core};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-pub struct RuleMeta {
-  pub id: String,
-  /// `"id"`, JSON-escaped and quoted.
-  pub id_json: Vec<u8>,
-  /// `,"ruleId":…,"severity":…,"note":…,"message":…` for ast-grep-shaped output.
-  pub tail: Vec<u8>,
-  pub is_error: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Severity {
+  Hint,
+  Info,
+  Warning,
+  Error,
 }
 
-pub struct Group {
+impl Severity {
+  pub fn as_str(self) -> &'static str {
+    match self {
+      Self::Hint => "hint",
+      Self::Info => "info",
+      Self::Warning => "warning",
+      Self::Error => "error",
+    }
+  }
+}
+
+#[derive(Debug)]
+pub struct RuleInfo {
+  pub id: String,
+  pub severity: Severity,
+  pub message: String,
+  pub note: Option<String>,
+}
+
+pub(crate) struct Group {
   pub core: RuleCore,
-  pub metas: Vec<RuleMeta>,
+  pub metas: Vec<RuleInfo>,
 }
 
 /// Everything that runs against files of one grammar.
 pub struct Unit {
-  pub lang: Arc<Lang>,
-  pub groups: Vec<Group>,
+  pub(crate) lang: Arc<Lang>,
+  pub(crate) groups: Vec<Group>,
   /// Kind id to the groups whose matcher can match that kind.
-  pub kind_map: Vec<Vec<u32>>,
-  /// Metavariable names of this unit's rules as JSON object keys: `"NAME":`.
-  pub var_keys: Vec<Vec<u8>>,
+  pub(crate) kind_map: Vec<Vec<u32>>,
+  pub(crate) var_names: Vec<String>,
 }
 
+#[cfg(feature = "internals")]
+impl Unit {
+  pub fn language(&self) -> &str {
+    &self.lang.name
+  }
+
+  pub fn groups(&self) -> impl ExactSizeIterator<Item = &[RuleInfo]> {
+    self.groups.iter().map(|group| group.metas.as_slice())
+  }
+
+  pub fn variables(&self) -> &[String] {
+    &self.var_names
+  }
+}
+
+/// Compiled rules, reusable by any number of scanners.
 pub struct RuleSet {
-  pub units: Vec<Unit>,
-  pub rule_count: usize,
+  pub(crate) units: Vec<Unit>,
+  rule_count: usize,
+  warnings: Vec<String>,
 }
 
 impl RuleSet {
-  pub fn unit_for(&self, lang_name: &str) -> Option<usize> {
+  /// Compile ast-grep rules from a multi-document YAML string.
+  pub fn compile(yaml: &str, registry: &mut Registry) -> Result<Self, String> {
+    plan_yaml(yaml, "YAML", registry)?.compile()
+  }
+
+  pub fn rule_count(&self) -> usize {
+    self.rule_count
+  }
+
+  /// Rules with no eligible node kind are skipped and reported here.
+  pub fn warnings(&self) -> &[String] {
+    &self.warnings
+  }
+
+  pub(crate) fn unit_for(&self, lang_name: &str) -> Option<usize> {
     self.units.iter().position(|u| u.lang.name == lang_name)
+  }
+
+  #[cfg(feature = "internals")]
+  pub fn units(&self) -> &[Unit] {
+    &self.units
   }
 }
 
@@ -62,7 +114,13 @@ fn current_target() -> String {
   }
 }
 
-pub fn load_sgconfig(path: &Path, registry: &mut Registry) -> Result<(), String> {
+/// Load custom grammars from the given ast-grep config file.
+///
+/// # Safety
+///
+/// Every declared symbol must be a compatible tree-sitter grammar constructor
+/// in a trusted native library.
+pub unsafe fn load_sgconfig(path: &Path, registry: &mut Registry) -> Result<(), String> {
   let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
   let doc: Value = serde_yaml::from_str(&text).map_err(|e| format!("cannot parse config {}: {e}", path.display()))?;
   let base = path.parent().unwrap_or(Path::new("."));
@@ -86,14 +144,17 @@ pub fn load_sgconfig(path: &Path, registry: &mut Registry) -> Result<(), String>
       .and_then(|v| v.as_sequence())
       .map(|s| s.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
       .unwrap_or_default();
-    registry.register_custom(CustomDecl {
-      name: name.to_string(),
-      library_path: base.join(lib),
-      symbol: decl.get("languageSymbol").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("tree_sitter_{name}")),
-      meta_var_char: one_char("metaVarChar"),
-      expando_char: one_char("expandoChar"),
-      extensions,
-    })?;
+    // SAFETY: the caller guarantees the origin and signature of each symbol.
+    unsafe {
+      registry.register_custom(CustomDecl {
+        name: name.to_string(),
+        library_path: base.join(lib),
+        symbol: decl.get("languageSymbol").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| format!("tree_sitter_{name}")),
+        meta_var_char: one_char("metaVarChar"),
+        expando_char: one_char("expandoChar"),
+        extensions,
+      })
+    }?;
   }
   Ok(())
 }
@@ -105,7 +166,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &["transform", "rewriters", "files", "ignore
 /// One rule, read and checked but not compiled.
 struct Pending {
   doc: Value,
-  meta: RuleMeta,
+  meta: RuleInfo,
   /// Index of its grammar in `Plan::langs`, and of its `Unit` once compiled.
   unit: usize,
 }
@@ -115,17 +176,22 @@ struct Pending {
 /// slow part, and `compile` can run while the files are being listed.
 pub struct Plan {
   /// One per grammar with rules, in order of first appearance.
-  pub langs: Vec<Arc<Lang>>,
+  langs: Vec<Arc<Lang>>,
   pending: Vec<Pending>,
 }
 
+#[cfg(feature = "internals")]
 pub fn plan_rules(path: &Path, registry: &mut Registry) -> Result<Plan, String> {
-  use serde::Deserialize;
   let text = std::fs::read_to_string(path).map_err(|e| format!("Cannot read rule {}: {e}", path.display()))?;
+  plan_yaml(&text, path.display(), registry)
+}
+
+fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry) -> Result<Plan, String> {
+  use serde::Deserialize;
   let mut plan = Plan { langs: Vec::new(), pending: Vec::new() };
 
-  for de in serde_yaml::Deserializer::from_str(&text) {
-    let doc = Value::deserialize(de).map_err(|e| format!("Cannot parse rule {}: {e}", path.display()))?;
+  for de in serde_yaml::Deserializer::from_str(text) {
+    let doc = Value::deserialize(de).map_err(|e| format!("Cannot parse rule {label}: {e}"))?;
     if doc.is_null() {
       continue;
     }
@@ -141,32 +207,26 @@ pub fn plan_rules(path: &Path, registry: &mut Registry) -> Result<Plan, String> 
         return Err(fail(format!("unknown field `{key}`")));
       }
     }
-    let severity = doc.get("severity").and_then(|v| v.as_str()).unwrap_or("hint");
-    if !["hint", "info", "warning", "error", "off"].contains(&severity) {
-      return Err(fail(format!("unknown severity `{severity}`")));
-    }
-    if severity == "off" {
-      continue;
-    }
+    let severity = match doc.get("severity").and_then(Value::as_str).unwrap_or("hint") {
+      "hint" => Severity::Hint,
+      "info" => Severity::Info,
+      "warning" => Severity::Warning,
+      "error" => Severity::Error,
+      "off" => continue,
+      other => return Err(fail(format!("unknown severity `{other}`"))),
+    };
     let lang_name = doc.get("language").and_then(|v| v.as_str()).ok_or_else(|| fail("a rule needs a `language`".into()))?;
     let lang = registry.resolve(lang_name).ok_or_else(|| fail(format!("{lang_name} is not supported!")))?;
     if doc.get("rule").is_none() {
       return Err(fail("a rule needs a `rule`".into()));
     }
 
-    let mut tail = Vec::new();
-    tail.extend_from_slice(b",\"ruleId\":");
-    write_json_str(&mut tail, id.as_bytes());
-    tail.extend_from_slice(format!(",\"severity\":\"{severity}\",\"note\":").as_bytes());
-    match doc.get("note").and_then(|v| v.as_str()) {
-      Some(note) => write_json_str(&mut tail, note.as_bytes()),
-      None => tail.extend_from_slice(b"null"),
-    }
-    tail.extend_from_slice(b",\"message\":");
-    write_json_str(&mut tail, doc.get("message").and_then(|v| v.as_str()).unwrap_or("").as_bytes());
-    let mut id_json = Vec::new();
-    write_json_str(&mut id_json, id.as_bytes());
-    let meta = RuleMeta { id: id.to_string(), id_json, tail, is_error: severity == "error" };
+    let meta = RuleInfo {
+      id: id.to_string(),
+      severity,
+      note: doc.get("note").and_then(Value::as_str).map(str::to_string),
+      message: doc.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+    };
 
     let unit = match plan.langs.iter().position(|l| Arc::ptr_eq(l, &lang)) {
       Some(unit) => unit,
@@ -181,8 +241,9 @@ pub fn plan_rules(path: &Path, registry: &mut Registry) -> Result<Plan, String> 
 }
 
 impl Plan {
-  pub fn unit_for(&self, lang_name: &str) -> Option<usize> {
-    self.langs.iter().position(|l| l.name == lang_name)
+  #[cfg(feature = "internals")]
+  pub fn languages(&self) -> &[Arc<Lang>] {
+    &self.langs
   }
 
   /// Compile every rule. Unit `i` of the result is the grammar `langs[i]`.
@@ -233,10 +294,7 @@ impl Plan {
       return Err(message);
     }
     warnings.sort();
-    for (_, warning) in warnings {
-      eprintln!("{warning}");
-    }
-    Ok(RuleSet { units, rule_count })
+    Ok(RuleSet { units, rule_count, warnings: warnings.into_iter().map(|(_, message)| message).collect() })
   }
 }
 
@@ -248,7 +306,7 @@ type Note = (usize, String);
 
 fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Unit, Vec<Note>), Note> {
   let mut vars = Interner::default();
-  let mut unit = Unit { kind_map: vec![Vec::new(); lang.nkinds], lang: lang.clone(), groups: Vec::new(), var_keys: Vec::new() };
+  let mut unit = Unit { kind_map: vec![Vec::new(); lang.nkinds], lang: lang.clone(), groups: Vec::new(), var_names: Vec::new() };
   let mut group_index: HashMap<String, usize> = HashMap::new();
   let mut warnings = Vec::new();
 
@@ -281,19 +339,6 @@ fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Uni
     group_index.insert(key, g);
   }
 
-  unit.var_keys = vars
-    .names
-    .iter()
-    .map(|n| {
-      let mut k = Vec::new();
-      write_json_str(&mut k, n.as_bytes());
-      k.push(b':');
-      k
-    })
-    .collect();
+  unit.var_names = vars.names;
   Ok((unit, warnings))
-}
-
-pub fn load_rules(path: &Path, registry: &mut Registry) -> Result<RuleSet, String> {
-  plan_rules(path, registry)?.compile()
 }

@@ -1,0 +1,43 @@
+# astscan-core
+
+Fast structural code search over in-memory source with ast-grep rule YAML.
+Compile rules once, share them across workers, and reuse one scanner per
+worker. The scanner flattens each syntax tree once and dispatches candidate
+rules by node kind. Identical matchers run once even when several rule IDs
+share them.
+
+```rust
+use astscan_core::{Registry, RuleSet, Scanner};
+
+let yaml = r#"
+id: log-call
+language: JavaScript
+rule:
+  pattern: console.log($ARG)
+"#;
+let rules = RuleSet::compile(yaml, &mut Registry::default()).unwrap();
+let mut scanner = Scanner::new(&rules);
+let source = "console.log('hello');";
+
+scanner.scan("js", source, |found| {
+    assert_eq!(found.rules().next().unwrap().id, "log-call");
+    for (name, bytes) in found.single_captures() {
+        assert_eq!(name, "ARG");
+        assert_eq!(&source[bytes.start as usize..bytes.end as usize], "'hello'");
+    }
+}).unwrap();
+```
+
+Results borrow the scanner's buffers for the duration of the callback.
+Matches, captures, and secondary labels use UTF-8 byte ranges into the
+original source, including for scripts and styles embedded in HTML.
+`Match::rules` yields the rule metadata after applying `ast-grep-ignore`.
+Compilation warnings are available via `RuleSet::warnings`.
+
+The default parser uses tree-sitter. `Scanner::with_parser` can opt into
+`ParserKind::Fast`, which drives the same grammars and falls back to
+tree-sitter when it needs error recovery. Building the library requires a C
+compiler for the grammars and the tree-flattening routine.
+
+See the [repository README](../../README.md) for the supported rule syntax
+and CLI benchmarks.

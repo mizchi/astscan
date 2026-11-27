@@ -5,9 +5,9 @@
 //! error recovery, so a deterministic driver would produce their tree
 //! without help. The rest need GLR (`split`) or error recovery (`error`).
 //!
-//!   cargo run --release --example glr_probe -- <dir>...
+//!   cargo run --release -p astscan-experiments --bin glr_probe -- <dir>...
 
-use astscan::lang::Registry;
+use astscan_core::Registry;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -63,7 +63,7 @@ fn main() {
     .map(|(_, n)| n.clone())
     .collect::<std::collections::BTreeSet<_>>()
     .into_iter()
-    .filter_map(|n| registry.resolve(&n).map(|l| (n, l.ts.clone())))
+    .filter_map(|n| registry.grammar(&n).map(|l| (n, l.builtin_language().expect("built-in grammar").clone())))
     .collect();
 
   let next = AtomicUsize::new(0);

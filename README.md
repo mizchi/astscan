@@ -1,13 +1,17 @@
 # astscan
 
-Runs a file of [ast-grep](https://github.com/ast-grep/ast-grep) rules over a
-source tree and prints what matched. It does the extraction half of
-`ast-grep scan` and nothing else: no fixes, no rewriting, no diagnostics
-rendering.
+Fast multi-rule structural code search using [ast-grep](https://github.com/ast-grep/ast-grep)
+rules. It implements the extraction half of `ast-grep scan`.
+
+- [`astscan-core`](crates/astscan-core/) is the Rust library. It compiles
+  rule YAML once and returns structured matches from in-memory source.
+- `astscan` is the CLI. It finds source files, scans them in parallel,
+  and handles JSON output and the optional persistent cache.
+- [`experiments/`](experiments/) contains the parser and storage probes.
 
 It exists for [jev-lint](https://github.com/mizchi/jev-lint), which hands
-ast-grep about 200 rules at once and reads the matches back as JSON. On that
-workload astscan reports the same matches 3 to 50 times faster.
+ast-grep about 200 rules at once and reads the matches back as JSON. On
+the workloads below astscan reports the same matches 3 to 50 times faster.
 
 ```sh
 astscan scan --rule rules.yml --json=stream -- src   # ast-grep's JSON lines
@@ -86,23 +90,23 @@ and 180 MB for `slim`.
 Where the time went, and what was done about it:
 
 - **One tree walk per file, not one per rule.** The tree-sitter tree is
-  flattened once into pre-order arrays (`src/tree.rs`). Every node is one
+  flattened once into pre-order arrays (`crates/astscan-core/src/tree.rs`). Every node is one
   array index, a subtree is a contiguous index range, and parent and sibling
   are array reads. Each node is dispatched by kind to only the rules that can
   match that kind.
 - **Rules that share a matcher run once.** jev-lint emits the same matcher
   under several ids (`x@JavaScript` and `x@Jsx` are one grammar). Identical
   matchers are merged and the match is reported under every id.
-- **Flattening reads the tree directly.** `csrc/flatten.c` walks tree-sitter's
+- **Flattening reads the tree directly.** `crates/astscan-core/csrc/flatten.c` walks tree-sitter's
   subtrees through its own inline accessors instead of a cursor, which was
   3.2x faster. It depends on private headers, so the tree-sitter version is
   pinned exactly; `ASTSCAN_CHECK_FLATTEN=1` compares it with the cursor
   implementation on every file scanned.
 - **Backtracking without cloning.** The metavariable environment is three
   append-only stacks. Trying a sub-rule is a mark, and undoing it a truncate.
-- **SIMD where a byte scan is the inner loop** (`src/simd.rs`, NEON and SSE2):
+- **SIMD where a byte scan is the inner loop** (`crates/astscan-core/src/simd.rs`, NEON and SSE2):
   finding the next node of a kind in the kind array for `has: {kind, stopBy:
-  end}`, and finding the next byte a JSON string must escape. Newline
+  end}`, and finding the next byte a JSON string must escape (`src/simd.rs`). Newline
   indexing, the `ast-grep-ignore` pre-check and UTF-8 validation use `memchr`
   and `simdutf8`.
 - **Columns on long lines.** A column is a character count from the start of
@@ -121,12 +125,12 @@ What is left is tree-sitter: in `slim` mode 73% to 85% of CPU time is inside
 A compiled tree-sitter grammar is parse tables, a lex function and sometimes
 an external scanner. tree-sitter's runtime drives them with reference-counted
 subtrees, because it is built for re-parsing a file as it is edited. astscan
-parses a file once and throws the tree away, so `src/fastparse.rs` drives the
+parses a file once and throws the tree away, so `crates/astscan-core/src/fastparse.rs` drives the
 same tables itself: arenas instead of reference counts, no bookkeeping for
 reuse, and the flat arrays as the direct output. The grammar's lex function
 and scanner are still called as they are.
 
-GLR is not optional. Measured with `examples/glr_probe.rs`, 83% of TypeScript
+GLR is not optional. Measured with `experiments/src/bin/glr_probe.rs`, 83% of TypeScript
 and 99% of Go and JavaScript (by bytes) is in files where the stack forks at
 least once. So the fork, merge and tree-selection rules are a port of
 tree-sitter's. Error recovery is not ported: a file that needs it is handed
@@ -204,7 +208,9 @@ it was idle. The Go run prints 543 MB, which is what its time is.)
 
 ```sh
 cargo build --release
-cargo test --release          # unit tests and black-box CLI tests
+cargo test --release          # core tests and black-box CLI tests
+cargo build --release -p astscan-core
+cargo check -p astscan-experiments
 AST_GREP=/path/to/ast-grep node tools/diff.mjs --rule rules.yml --cwd some/repo
 ```
 

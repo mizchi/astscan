@@ -6,7 +6,7 @@
 //! the store has seen costs nothing; the rest is new bytes. Finer chunks
 //! reuse more but need a longer list per file version, so both are reported.
 //!
-//!   cargo run --release --example chunk_probe -- <repo> [commits=2000] [Language,Language...]
+//!   cargo run --release -p astscan-experiments --bin chunk_probe -- <repo> [commits=2000] [Language,Language...]
 //!
 //! Schemes: the whole file; content-defined chunks at three sizes (a gear
 //! rolling hash with FastCDC's two-mask normalisation); the children of the
@@ -26,8 +26,8 @@
 //! It also counts how many directories a commit touches, which is what a
 //! checkout of one subdirectory has to live with.
 
-use astscan::lang::Registry;
-use astscan::tree::FlatTree;
+use astscan_core::Registry;
+use astscan_core::internals::FlatTree;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -296,10 +296,10 @@ fn main() {
       if only.as_ref().is_some_and(|only| !only.contains(&name)) {
         continue;
       }
-      let Some(lang) = registry.resolve(&name) else { continue };
+      let Some(lang) = registry.grammar(&name) else { continue };
       let parser = parsers.entry(name.clone()).or_insert_with(|| {
         let mut p = tree_sitter::Parser::new();
-        p.set_language(&lang.ts).expect("a built-in grammar");
+        p.set_language(lang.builtin_language().expect("built-in grammar")).expect("a built-in grammar");
         p
       });
       let mut put = |oid: &str, count: bool, schemes: &mut Vec<Scheme>| -> Option<usize> {

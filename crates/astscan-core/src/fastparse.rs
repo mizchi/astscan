@@ -16,10 +16,12 @@
 //! What it leaves out is error recovery. When every version is stuck, `parse`
 //! returns `Err` and the caller parses the file with tree-sitter instead. So
 //! a tree it does return is the tree tree-sitter would have built;
-//! `examples/fastparse_probe.rs` checks that node for node.
+//! `experiments/src/bin/fastparse_probe.rs` checks that node for node.
 
+use crate::lang::Lang;
 use crate::tree::{F_EXTRA, F_NAMED, F_NAMED_LEAF, FlatTree, NONE};
 use std::ffi::{c_char, c_void};
+use std::sync::Arc;
 
 const SYM_END: u16 = 0;
 const SYM_ERROR: u16 = 65535;
@@ -260,46 +262,36 @@ const DENSE_TABLE_LIMIT: usize = 1 << 25;
 /// states of a grammar are stored compressed, and searching a row's groups
 /// for a symbol was a quarter of the parse. Built once per grammar and shared
 /// by every thread; `None` for a grammar too large to be worth it.
-fn dense_table(lang: *const RawLanguage) -> Option<std::sync::Arc<[u16]>> {
-  /// By grammar address.
-  type Built = (usize, Option<std::sync::Arc<[u16]>>);
-  static TABLES: std::sync::Mutex<Vec<Built>> = std::sync::Mutex::new(Vec::new());
-  let mut tables = TABLES.lock().unwrap_or_else(|e| e.into_inner());
-  if let Some((_, table)) = tables.iter().find(|(key, _)| *key == lang as usize) {
-    return table.clone();
-  }
+fn dense_table(lang: *const RawLanguage) -> Option<Box<[u16]>> {
   // SAFETY: a grammar is static data, and its tables are as long as its counts say.
   let l = unsafe { &*lang };
   let (states, symbols) = (l.state_count as usize, l.symbol_count as usize);
-  let table = (states * symbols <= DENSE_TABLE_LIMIT).then(|| {
-    let mut cells = vec![0u16; states * symbols];
-    unsafe {
-      let large = (l.large_state_count as usize).min(states);
-      cells[..large * symbols].copy_from_slice(std::slice::from_raw_parts(l.parse_table, large * symbols));
-      for state in large..states {
-        let row = &mut cells[state * symbols..(state + 1) * symbols];
-        let mut data = l.small_parse_table.add(*l.small_parse_table_map.add(state - large) as usize);
-        let group_count = *data;
-        data = data.add(1);
-        for _ in 0..group_count {
-          let value = *data;
-          let count = *data.add(1) as usize;
-          data = data.add(2);
-          for j in 0..count {
-            let symbol = *data.add(j) as usize;
-            // A symbol sits in one group; were it in two, the search takes the first.
-            if symbol < symbols && row[symbol] == 0 {
-              row[symbol] = value;
-            }
+  let cell_count = states.checked_mul(symbols).filter(|&n| n <= DENSE_TABLE_LIMIT)?;
+  let mut cells = vec![0u16; cell_count];
+  unsafe {
+    let large = (l.large_state_count as usize).min(states);
+    cells[..large * symbols].copy_from_slice(std::slice::from_raw_parts(l.parse_table, large * symbols));
+    for state in large..states {
+      let row = &mut cells[state * symbols..(state + 1) * symbols];
+      let mut data = l.small_parse_table.add(*l.small_parse_table_map.add(state - large) as usize);
+      let group_count = *data;
+      data = data.add(1);
+      for _ in 0..group_count {
+        let value = *data;
+        let count = *data.add(1) as usize;
+        data = data.add(2);
+        for j in 0..count {
+          let symbol = *data.add(j) as usize;
+          // A symbol sits in one group; were it in two, the search takes the first.
+          if symbol < symbols && row[symbol] == 0 {
+            row[symbol] = value;
           }
-          data = data.add(count);
         }
+        data = data.add(count);
       }
     }
-    std::sync::Arc::<[u16]>::from(cells)
-  });
-  tables.push((lang as usize, table.clone()));
-  table
+  }
+  Some(cells.into_boxed_slice())
 }
 
 const F_NODE_EXTRA: u8 = 1;
@@ -427,12 +419,11 @@ pub enum Bail {
 
 pub struct Parser {
   lang: *const RawLanguage,
-  /// The grammar's parse table uncompressed, or null. Points into `_dense`.
+  /// The grammar's parse table uncompressed, or null. Points into `_owner`.
   dense: *const u16,
-  _dense: Option<std::sync::Arc<[u16]>>,
   symbol_count: usize,
   /// Keeps the grammar (and a dylib it may live in) alive.
-  _owner: tree_sitter::Language,
+  _owner: Arc<Lang>,
   lexer: Box<Lexer>,
   scanner: *mut c_void,
   /// Serialized scanner states by id; id 0 is the empty state.
@@ -476,9 +467,12 @@ impl Drop for Parser {
 }
 
 impl Parser {
-  pub fn new(language: &tree_sitter::Language) -> Result<Self, Bail> {
-    let owner = language.clone();
-    let lang = owner.clone().into_raw() as *const RawLanguage;
+  pub fn new(owner: Arc<Lang>) -> Result<Self, Bail> {
+    let raw_language = owner.ts.clone().into_raw();
+    // SAFETY: pair into_raw with from_raw to release the reference on return.
+    // The parser keeps its native grammar alive through owner.
+    let _language = unsafe { tree_sitter::Language::from_raw(raw_language) };
+    let lang = raw_language.cast::<RawLanguage>();
     // SAFETY: a `tree_sitter::Language` wraps a pointer to a static `TSLanguage`.
     let raw = unsafe { &*lang };
     if raw.abi_version < 14 || raw.lex_fn.is_none() {
@@ -508,11 +502,10 @@ impl Parser {
       token_end: 0,
       at_eof: false,
     });
-    let dense_owner = dense_table(lang);
+    let dense = owner.dense_table.get_or_init(|| dense_table(lang)).as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
     Ok(Parser {
       lang,
-      dense: dense_owner.as_ref().map_or(std::ptr::null(), |t| t.as_ptr()),
-      _dense: dense_owner,
+      dense,
       symbol_count: raw.symbol_count as usize,
       _owner: owner,
       lexer,

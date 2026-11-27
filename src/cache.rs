@@ -70,8 +70,8 @@ struct Slot {
   offset: usize,
   len: u32,
   raw_len: u32,
-  matches: u32,
-  errors: u32,
+  #[cfg(test)]
+  counts: (u32, u32),
   checksum: u32,
   flags: u32,
   /// Served during this run: what a compaction keeps.
@@ -83,8 +83,8 @@ pub struct Hit<'a> {
   stored: &'a [u8],
   raw_len: u32,
   flags: u32,
-  pub matches: u32,
-  pub errors: u32,
+  #[cfg(test)]
+  counts: (u32, u32),
 }
 
 /// A worker's compressor and decompressor, kept from file to file.
@@ -232,8 +232,8 @@ impl Cache {
           offset: at + RECORD,
           len,
           raw_len: u32_at(&map, at + 28),
-          matches: u32_at(&map, at + 16),
-          errors: u32_at(&map, at + 20),
+          #[cfg(test)]
+          counts: (u32_at(&map, at + 16), u32_at(&map, at + 20)),
           checksum: u32_at(&map, at + 32),
           flags: u32_at(&map, at + 36),
           used: AtomicBool::new(false),
@@ -256,7 +256,13 @@ impl Cache {
       return None;
     }
     slot.used.store(true, Ordering::Relaxed);
-    Some(Hit { stored, raw_len: slot.raw_len, flags: slot.flags, matches: slot.matches, errors: slot.errors })
+    Some(Hit {
+      stored,
+      raw_len: slot.raw_len,
+      flags: slot.flags,
+      #[cfg(test)]
+      counts: slot.counts,
+    })
   }
 
   /// Open the file for appending, repairing or starting it as needed.
@@ -420,7 +426,7 @@ mod tests {
     drop(cache);
     let cache = Cache::open(&dir, 7);
     let hit = cache.get(1).expect("stored");
-    assert_eq!((hit.matches, hit.errors), (1, 0));
+    assert_eq!(hit.counts, (1, 0));
     assert_eq!(output(&cache, 1).expect("stored"), b"one\n");
     assert_eq!(output(&cache, 2).expect("stored"), b"");
     assert!(cache.get(3).is_none());

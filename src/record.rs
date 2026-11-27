@@ -2,8 +2,8 @@
 //!
 //! A line of output is the file's own text and positions wrapped in JSON. All
 //! of it follows from the source plus a few numbers: which rule group
-//! matched, where, and where each metavariable and label sits. `Found` is
-//! those numbers. Both a fresh scan and a cache hit produce `Found`s and hand
+//! matched, where, and where each metavariable and label sits. Both a fresh
+//! scan and a cache hit produce `Found`s and hand
 //! them to the same writer, so what a hit prints is what the scan printed.
 //!
 //! In the cache a file's matches are a run of varints, a dozen or so bytes
@@ -11,50 +11,7 @@
 //! those bytes: decoding checks every length, and the caller checks every
 //! index and offset against the rules and the file before using them.
 
-/// A byte range of the source.
-pub type Span = (u32, u32);
-
-#[derive(Default, Debug, PartialEq, Eq, Clone)]
-pub struct Found {
-  /// Index of the rule group within its unit.
-  pub group: u32,
-  pub start: u32,
-  pub end: u32,
-  /// Indices, within the group, of the rules an ignore comment silenced here.
-  pub dead: Vec<u32>,
-  /// `(var, span)`; a later entry for a var shadows an earlier one.
-  pub single: Vec<(u32, Span)>,
-  /// `(var, first, count)` into `pool`.
-  pub multi: Vec<(u32, u32, u32)>,
-  pub pool: Vec<Span>,
-  /// ast-grep's "secondary" labels.
-  pub labels: Vec<Span>,
-}
-
-impl Found {
-  pub fn clear(&mut self) {
-    self.dead.clear();
-    self.single.clear();
-    self.multi.clear();
-    self.pool.clear();
-    self.labels.clear();
-  }
-
-  /// The largest offset any of its spans reaches, and whether every span is
-  /// start-before-end: what a caller compares with the length of the file.
-  pub fn extent(&self) -> Option<u32> {
-    let own = [(self.start, self.end)];
-    let spans = own.iter().chain(self.single.iter().map(|(_, s)| s)).chain(&self.pool).chain(&self.labels);
-    let mut max = 0;
-    for &(start, end) in spans {
-      if start > end {
-        return None;
-      }
-      max = max.max(end);
-    }
-    Some(max)
-  }
-}
+pub use astscan_core::internals::{Found, Span};
 
 fn put(out: &mut Vec<u8>, mut value: u32) {
   while value >= 0x80 {

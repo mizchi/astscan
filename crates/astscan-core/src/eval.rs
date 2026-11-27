@@ -244,16 +244,14 @@ impl<'a> Matcher<'a> {
   }
 
   fn has_until(&self, rel: &Relation, stop: &Rule, n: u32, env: &mut Env) -> Option<u32> {
-    let mut kids = self.t.children(n);
-    while let Some(c) = kids.next(self.t) {
-      if let Some(m) = self.eval(&rel.rule, c, env) {
+    let t = self.t;
+    let mut child = n + 1;
+    while child < t.sub_end[n as usize] {
+      if let Some(m) = self.eval(&rel.rule, child, env) {
         return Some(m);
       }
-      if !self.matches_fresh(stop, c)
-        && let Some(m) = self.has_until(rel, stop, c, env)
-      {
-        return Some(m);
-      }
+      // Pre-order traversal. A stop node was tested above, and its descendants are skipped.
+      child = if self.matches_fresh(stop, child) { t.sub_end[child as usize] } else { child + 1 };
     }
     None
   }
@@ -455,22 +453,41 @@ impl<'a> Matcher<'a> {
 
   /// Are two nodes the same code? What a repeated metavariable requires.
   fn exact(&self, goal: u32, cand: u32) -> bool {
-    if goal == cand {
-      return true;
-    }
     let t = self.t;
-    if t.is_named_leaf(goal) || t.is_named_leaf(cand) {
-      return self.text(goal) == self.text(cand);
-    }
-    if self.kind(goal) != self.kind(cand) {
-      return false;
-    }
-    let (mut g, mut c) = (t.children(goal), t.children(cand));
+    let (mut g, mut c) = (goal, cand);
     loop {
-      match (g.next(t), c.next(t)) {
-        (Some(a), Some(b)) if self.exact(a, b) => continue,
-        (None, None) => return true,
-        _ => return false,
+      if g != c {
+        if t.is_named_leaf(g) || t.is_named_leaf(c) {
+          if self.text(g) != self.text(c) {
+            return false;
+          }
+        } else {
+          if self.kind(g) != self.kind(c) {
+            return false;
+          }
+          match (t.children(g).peek(), t.children(c).peek()) {
+            (Some(a), Some(b)) => {
+              (g, c) = (a, b);
+              continue;
+            }
+            (None, None) => {}
+            _ => return false,
+          }
+        }
+      }
+      // Ascend both trees together until we can compare their next siblings.
+      loop {
+        if g == goal || c == cand {
+          return g == goal && c == cand;
+        }
+        match (t.next_sibling(g), t.next_sibling(c)) {
+          (NONE, NONE) => (g, c) = (t.parent[g as usize], t.parent[c as usize]),
+          (NONE, _) | (_, NONE) => return false,
+          (a, b) => {
+            (g, c) = (a, b);
+            break;
+          }
+        }
       }
     }
   }

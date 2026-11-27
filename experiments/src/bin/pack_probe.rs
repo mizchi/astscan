@@ -7,7 +7,7 @@
 //! several policies, reporting the bytes stored and the bytes a reader has to
 //! fetch to get one version back.
 //!
-//!   cargo run --release --example pack_probe -- <repo> [commits=2000]
+//!   cargo run --release -p astscan-experiments --bin pack_probe -- <repo> [commits=2000]
 //!
 //! Policies:
 //! - alone: each version compressed by itself.

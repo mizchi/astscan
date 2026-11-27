@@ -15,19 +15,31 @@ dependencies = [
 name = "astscan"
 version = "0.1.0"
 dependencies = [
- "cc",
+ "astscan-core",
  "ignore",
  "itoa",
- "libloading",
  "libmimalloc-sys",
  "memchr",
  "memmap2",
  "mimalloc",
+ "serde_json",
+ "simdutf8",
+ "tree-sitter",
+ "xxhash-rust",
+ "zstd",
+]
+
+[[package]]
+name = "astscan-core"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libloading",
+ "memchr",
  "regex",
  "serde",
  "serde_json",
  "serde_yaml",
- "simdutf8",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -56,6 +68,16 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
+]
+
+[[package]]
+name = "astscan-experiments"
+version = "0.1.0"
+dependencies = [
+ "astscan-core",
+ "ignore",
+ "memchr",
+ "tree-sitter",
  "xxhash-rust",
  "zstd",
 ]
