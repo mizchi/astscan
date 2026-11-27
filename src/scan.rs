@@ -94,6 +94,7 @@ pub struct Shared<'a> {
   pub match_count: AtomicUsize,
   pub file_count: AtomicUsize,
   pub byte_count: AtomicUsize,
+  pub skipped_inputs: AtomicUsize,
   pub options: ScanOptions,
   pub fast_parsed: [AtomicUsize; 2],
   pub phase_nanos: [AtomicUsize; 3],
@@ -105,6 +106,11 @@ pub struct Shared<'a> {
 }
 
 impl<'a> Shared<'a> {
+  pub fn skip(&self, reason: impl std::fmt::Display) {
+    self.skipped_inputs.fetch_add(1, Ordering::Relaxed);
+    eprintln!("astscan: skipped {reason}");
+  }
+
   /// The compiled rules, waiting for them if need be. `None` if compilation failed.
   fn compiled(&self) -> Option<&'a Compiled> {
     self.rules.wait().as_ref().ok()
@@ -174,8 +180,10 @@ impl<'a> Worker<'a> {
     let mut src = std::mem::take(&mut self.src);
     src.clear();
     let read = std::fs::File::open(path).and_then(|mut f| std::io::Read::read_to_end(&mut f, &mut src));
-    if read.is_ok() && !src.is_empty() {
-      self.scan_bytes(&src, path, target);
+    match read {
+      Ok(0) => {}
+      Ok(_) => self.scan_bytes(&src, path, target),
+      Err(err) => self.shared.skip(format_args!("{}: {err}", path.display())),
     }
     self.src = src;
     if self.out.len() >= FLUSH_AT {
@@ -300,9 +308,13 @@ impl<'a> Worker<'a> {
 
   fn scan_text(&mut self, src: &[u8], display: &str, target: Target, compiled: &'a Compiled, recording: bool) -> bool {
     // A file that is not UTF-8 is skipped, as is one both huge and long.
-    let Ok(text) = simdutf8::basic::from_utf8(src) else { return true };
+    let Ok(text) = simdutf8::basic::from_utf8(src) else {
+      self.shared.skip(format_args!("{display}: input is not UTF-8"));
+      return false;
+    };
     if text.len() > MAX_FILE_SIZE && text.lines().count() > MAX_LINE_COUNT {
-      return true;
+      self.shared.skip(format_args!("{display}: input exceeds both {MAX_FILE_SIZE} bytes and {MAX_LINE_COUNT} lines"));
+      return false;
     }
 
     let shared = self.shared;
@@ -373,8 +385,9 @@ impl<'a> Worker<'a> {
         eprintln!("astscan: flatten mismatch in {display}: {diff}");
         std::process::exit(3);
       }
-      Err(ScanError::ParseFailed | ScanError::SourceTooLarge) => {
+      Err(err @ (ScanError::ParseFailed | ScanError::SourceTooLarge)) => {
         // A scan that did not finish must not be served by the cache.
+        self.shared.skip(format_args!("{display}: {err}"));
         return false;
       }
     }

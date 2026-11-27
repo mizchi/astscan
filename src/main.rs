@@ -32,8 +32,8 @@ Options:
   -j, --threads <N>     Worker threads (default: all cores)
       --parser <NAME>   tree-sitter (default), or fast: astscan's own driver over
                         the same grammars, falling back where it gives up
-      --cache <DIR>     Keep results in DIR and reuse them for files that did not
-                        change since a run with the same rules and output style
+      --cache <DIR>     Reuse results for unchanged files with the same rules
+      --fail-on-skipped Exit 2 if an input could not be scanned
       --stats           Print file, byte and match counts to stderr
   -h, --help            Print this help
   -V, --version         Print version
@@ -45,6 +45,7 @@ struct Args {
   mode: Mode,
   threads: usize,
   stats: bool,
+  fail_on_skipped: bool,
   fast_parser: bool,
   cache: Option<PathBuf>,
   paths: Vec<PathBuf>,
@@ -68,6 +69,7 @@ fn parse_args() -> Result<Option<Args>, String> {
   }
   let (mut rule, mut config, mut mode, mut threads, mut stats, mut paths) = (None, None, Mode::Stream, 0usize, false, Vec::new());
   let mut fast_parser = false;
+  let mut fail_on_skipped = false;
   let mut cache = None;
   let mut only_paths = false;
   while let Some(arg) = argv.next() {
@@ -92,6 +94,7 @@ fn parse_args() -> Result<Option<Args>, String> {
       "-c" | "--config" => config = Some(PathBuf::from(value("--config")?)),
       "-j" | "--threads" => threads = value("--threads")?.parse().map_err(|_| "`--threads` needs a number".to_string())?,
       "--stats" => stats = true,
+      "--fail-on-skipped" => fail_on_skipped = true,
       "--cache" => cache = Some(PathBuf::from(value("--cache")?)),
       "--parser" => {
         fast_parser = match value("--parser")?.as_str() {
@@ -115,7 +118,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     paths.push(PathBuf::from("."));
   }
   let rule = rule.ok_or("`--rule <FILE>` is required")?;
-  Ok(Some(Args { rule, config, mode, threads, stats, fast_parser, cache, paths }))
+  Ok(Some(Args { rule, config, mode, threads, stats, fail_on_skipped, fast_parser, cache, paths }))
 }
 
 /// Tree-sitter requires its allocator never to return null for a non-zero size.
@@ -150,6 +153,8 @@ fn cache_key(args: &Args, registry: &Registry) -> Result<u128, String> {
   let build = std::env::current_exe().and_then(std::fs::metadata).map_or(0, |m| m.len());
   let mut parts: Vec<Vec<u8>> = vec![
     env!("CARGO_PKG_VERSION").as_bytes().to_vec(),
+    // Older builds stored skipped inputs as successful zero-match scans.
+    b"completed-scans-v1".to_vec(),
     build.to_le_bytes().to_vec(),
     read(&args.rule)?,
     match &args.config {
@@ -250,7 +255,7 @@ fn run() -> Result<ExitCode, String> {
   for p in &args.paths[1..] {
     walk.add(p);
   }
-  walk.threads(threads).types(types.build().map_err(|e| e.to_string())?);
+  walk.require_git(false).threads(threads).types(types.build().map_err(|e| e.to_string())?);
 
   let cache = match &args.cache {
     Some(dir) => Some(Cache::open(dir, cache_key(&args, &registry)?)),
@@ -265,6 +270,7 @@ fn run() -> Result<ExitCode, String> {
     match_count: AtomicUsize::new(0),
     file_count: AtomicUsize::new(0),
     byte_count: AtomicUsize::new(0),
+    skipped_inputs: AtomicUsize::new(0),
     options: ScanOptions {
       parser: if args.fast_parser { ParserKind::Fast } else { ParserKind::TreeSitter },
       check_flatten: std::env::var_os("ASTSCAN_CHECK_FLATTEN").is_some(),
@@ -299,7 +305,13 @@ fn run() -> Result<ExitCode, String> {
   walk.build_parallel().run(|| {
     let mut batch = Batch { found: &found, local: Vec::new() };
     Box::new(move |entry| {
-      let Ok(entry) = entry else { return WalkState::Continue };
+      let entry = match entry {
+        Ok(entry) => entry,
+        Err(err) => {
+          shared_ref.skip(err);
+          return WalkState::Continue;
+        }
+      };
       if !entry.file_type().is_some_and(|t| t.is_file()) {
         return WalkState::Continue;
       }
@@ -353,9 +365,10 @@ fn run() -> Result<ExitCode, String> {
   if let Some(cache) = &cache {
     cache.finish();
   }
+  let skipped = shared.skipped_inputs.load(Ordering::Relaxed);
   if args.stats {
     eprintln!(
-      "astscan: {} rules in {} groups, {} files, {} bytes, {} matches, load {:.1}ms, walk {:.1}ms, total {:.1}ms, {} threads",
+      "astscan: {} rules in {} groups, {} files, {} bytes, {} matches, {skipped} skipped inputs, load {:.1}ms, walk {:.1}ms, total {:.1}ms, {} threads",
       rules.rules.rule_count(),
       rules.group_count(),
       shared.file_count.load(Ordering::Relaxed),
@@ -394,8 +407,14 @@ fn run() -> Result<ExitCode, String> {
       }
     }
   }
-  // ast-grep exits 1 when a rule of severity `error` matched.
-  Ok(if shared.error_matches.load(Ordering::Relaxed) > 0 { ExitCode::from(1) } else { ExitCode::SUCCESS })
+  // An incomplete strict run takes priority over an error match.
+  Ok(if args.fail_on_skipped && skipped > 0 {
+    ExitCode::from(2)
+  } else if shared.error_matches.load(Ordering::Relaxed) > 0 {
+    ExitCode::from(1)
+  } else {
+    ExitCode::SUCCESS
+  })
 }
 
 fn main() -> ExitCode {

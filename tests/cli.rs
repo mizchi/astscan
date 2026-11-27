@@ -19,7 +19,10 @@ struct Run {
 
 impl Case {
   fn new(name: &str, rules: &str, files: &[(&str, &str)]) -> Self {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    Self::new_in(Path::new(env!("CARGO_TARGET_TMPDIR")).join(name), rules, files)
+  }
+
+  fn new_in(dir: PathBuf, rules: &str, files: &[(&str, &str)]) -> Self {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("rules.yml"), rules).unwrap();
@@ -36,11 +39,16 @@ impl Case {
   }
 
   fn run_with(&self, json: &str, options: &[&str]) -> Run {
+    self.run_paths(json, options, &["src"])
+  }
+
+  fn run_paths(&self, json: &str, options: &[&str], paths: &[&str]) -> Run {
     let out = Command::new(env!("CARGO_BIN_EXE_astscan"))
       .current_dir(&self.dir)
       .args(["scan", "--rule", "rules.yml", &format!("--json={json}")])
       .args(options)
-      .args(["--", "src"])
+      .arg("--")
+      .args(paths)
       .output()
       .unwrap();
     let mut lines: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
@@ -72,6 +80,37 @@ fn pattern_captures_single_and_multi_metavariables() {
   assert_eq!(vars["single"]["A"]["text"], "one");
   let rest: Vec<&str> = vars["multi"]["REST"].as_array().unwrap().iter().map(|n| n["text"].as_str().unwrap()).collect();
   assert_eq!(rest, ["two", ",", "three"]);
+}
+
+#[test]
+fn skipped_inputs_are_reported_even_on_a_warm_cache() {
+  let case = Case::new("scan-skips", &rule("log", "JavaScript", "rule:\n  pattern: console.log($X)"), &[("good.js", "console.log(1);\n")]);
+  std::fs::write(case.dir.join("src/non-utf8.js"), b"console.log(2);\n// \xff").unwrap();
+  std::fs::write(case.dir.join("src/large.js"), "console.log(3);\n".repeat(200_001)).unwrap();
+  let paths = ["src/good.js", "src/non-utf8.js", "src/large.js"];
+  let cold = case.run_paths("stream", &["--cache", "cache"], &paths);
+  assert_eq!(cold.code, 0);
+  assert_eq!(texts(&cold), ["console.log(1)"]);
+  assert!(cold.stderr.contains("src/non-utf8.js: input is not UTF-8"), "{}", cold.stderr);
+  assert!(cold.stderr.contains("src/large.js: input exceeds both"), "{}", cold.stderr);
+  let warm = case.run_paths("stream", &["--cache", "cache", "--fail-on-skipped", "--stats"], &paths);
+  assert_eq!(warm.code, 2, "{}", warm.stderr);
+  assert_eq!(warm.lines, cold.lines);
+  assert!(warm.stderr.contains("2 skipped inputs"), "{}", warm.stderr);
+  assert!(warm.stderr.contains("cache: 1 hits, 2 misses"), "{}", warm.stderr);
+}
+
+#[test]
+fn a_missing_path_is_reported_and_takes_priority_over_an_error_match() {
+  let rules = rule("log", "JavaScript", "rule:\n  pattern: console.log($X)").replace("severity: hint", "severity: error");
+  let case = Case::new("missing-input", &rules, &[("good.js", "console.log(1);")]);
+  let paths = ["src/good.js", "src/missing.js"];
+  let regular = case.run_paths("stream", &[], &paths);
+  assert_eq!(regular.code, 1);
+  assert!(regular.stderr.contains("src/missing.js"), "{}", regular.stderr);
+  let strict = case.run_paths("stream", &["--fail-on-skipped"], &paths);
+  assert_eq!(strict.code, 2);
+  assert_eq!(strict.lines, regular.lines);
 }
 
 #[test]
@@ -178,6 +217,27 @@ fn rules_with_one_matcher_run_once_and_report_every_id() {
   let stream = case.run("stream");
   let ids: Vec<&str> = stream.lines.iter().map(|l| l["ruleId"].as_str().unwrap()).collect();
   assert_eq!(ids, ["a@JavaScript", "a@Jsx"]);
+}
+
+#[test]
+fn respects_gitignore_outside_a_repository() {
+  let case = Case::new_in(
+    std::env::temp_dir().join(format!("astscan-gitignore-test-{}", std::process::id())),
+    &rule("dbg", "TypeScript", "rule:\n  kind: debugger_statement"),
+    &[
+      ("kept.ts", "debugger;\n"),
+      ("generated/skipped.ts", "debugger;\n"),
+      ("generated/kept.ts", "debugger;\n"),
+      ("excluded/skipped.ts", "debugger;\n"),
+    ],
+  );
+  std::fs::write(case.dir.join(".gitignore"), "src/generated/*\n!src/generated/kept.ts\nsrc/excluded/\n").unwrap();
+  let run = case.run("stream");
+  std::fs::remove_dir_all(&case.dir).unwrap();
+
+  assert_eq!(run.code, 0, "{}", run.stderr);
+  let files: Vec<_> = run.lines.iter().map(|line| line["file"].as_str().unwrap()).collect();
+  assert_eq!(files, ["src/generated/kept.ts", "src/kept.ts"]);
 }
 
 #[test]
