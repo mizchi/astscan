@@ -1,0 +1,16 @@
+{
+  "id": "unmasked-log-value",
+  "message": "Unmasked external input may reach the log.",
+  "entryRule": "entry",
+  "entryFiles": ["app.ts"],
+  "models": [
+    { "kind": "source", "file": "apis.ts", "name": "input" },
+    { "kind": "sink", "file": "apis.ts", "name": "record", "argument": 0, "type": "string", "capture": { "rule": "recorded-value", "name": "VALUE" } },
+    { "kind": "sanitize-return", "file": "apis.ts", "name": "mask" },
+    { "kind": "guard", "file": "apis.ts", "name": "approved", "argument": 0 },
+    { "kind": "guard", "file": "apis.ts", "name": "approvedAsync", "argument": 0 },
+    { "kind": "propagate-return", "file": "apis.ts", "name": "copy", "argument": 0 },
+    { "kind": "sanitize-field", "file": "apis.ts", "name": "maskInPlace", "argument": 0, "field": "value" },
+    { "kind": "propagate-field", "file": "apis.ts", "name": "copyTo", "argument": 0, "target": 1, "field": "value" }
+  ]
+}

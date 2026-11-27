@@ -10,4 +10,6 @@ Run a probe with `cargo run --release -p astscan-experiments --bin <probe> -- â€
 | `pack_probe` | `<repo> [commits=2000]` | Compression and reconstruction cost for full versions and deltas |
 
 [Typed lint](typed-lint/) exercises structural evidence extraction and
-opt-in tsrs type queries over slim JSON matches.
+opt-in tsrs type queries over slim JSON matches. It also includes
+[compiler diagnostics and runtime traces](typed-lint/#compiler-diagnostics-and-runtime-traces)
+for TypeScript, JavaScript, Go, and Rust.

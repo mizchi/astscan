@@ -90,6 +90,14 @@ pub enum PNode {
 }
 
 impl PNode {
+  pub(crate) fn has_single_capture(&self, id: u16) -> bool {
+    match self {
+      Self::MetaVar(MetaVar::Capture(var, _)) => *var == id,
+      Self::Internal { children, .. } => children.iter().any(|child| child.has_single_capture(id)),
+      _ => false,
+    }
+  }
+
   /// An anonymous token: skipped in the goal after an ellipsis.
   pub fn is_trivial(&self) -> bool {
     matches!(self, PNode::Terminal { named: false, .. })
@@ -272,6 +280,7 @@ impl NthChild {
 pub enum Rule {
   Pattern(Pattern),
   Kind(u16),
+  Cypher(Box<crate::cypher::Step>),
   Regex(usize),
   NthChild(Box<NthChild>),
   Inside(Box<Relation>),
@@ -545,6 +554,7 @@ fn potential_kinds(rule: &Rule, util_kinds: &[Option<KindSet>]) -> Option<KindSe
   match rule {
     Rule::Pattern(p) => p.potential_kinds(),
     Rule::Kind(k) => Some(KindSet::one(*k)),
+    Rule::Cypher(step) => Some(KindSet::one(step.kind)),
     Rule::Regex(_) | Rule::Not(_) | Rule::Inside(_) | Rule::Has(_) | Rule::Precedes(_) | Rule::Follows(_) => None,
     Rule::NthChild(n) => potential_kinds(n.of_rule.as_ref()?, util_kinds),
     Rule::All(rs, _) => {
@@ -599,7 +609,7 @@ fn fill_kinds(rule: &mut Rule, util_kinds: &[Option<KindSet>]) {
       rel.kinds = potential_kinds(&rel.rule, util_kinds);
       rel.one_kind = rel.kinds.as_ref().and_then(|k| k.single());
     }
-    Rule::Pattern(_) | Rule::Kind(_) | Rule::Regex(_) | Rule::Matches(_) => {}
+    Rule::Pattern(_) | Rule::Kind(_) | Rule::Cypher(_) | Rule::Regex(_) | Rule::Matches(_) => {}
   }
 }
 

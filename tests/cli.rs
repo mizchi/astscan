@@ -83,6 +83,36 @@ fn pattern_captures_single_and_multi_metavariables() {
 }
 
 #[test]
+fn added_languages_match_patterns_and_capture_from_directory_inputs() {
+  let samples = [
+    ("a.mbt", "moonbit", "MoonBit", "fn $VALUE() -> Int { 42 }", "fn answer() -> Int { 42 }\n", "answer"),
+    ("a.zig", "zig", "Zig", "const $VALUE = @import(\"std\");", "const std = @import(\"std\");\n", "std"),
+    ("a.toml", "toml", "Toml", "$VALUE = 1", "enabled = 1\nsize = 2\n", "enabled"),
+    ("a.sql", "sql", "Sql", "SELECT id FROM $VALUE", "SELECT id FROM users;\n", "users"),
+    ("a.xml", "xml", "Xml", "<$VALUE/>", "<root><widget/></root>\n", "widget"),
+  ];
+  let rules = samples
+    .iter()
+    .map(|(_, alias, name, pattern, _, _)| rule(name, alias, &format!("rule:\n  pattern: '{pattern}'")))
+    .collect::<Vec<_>>()
+    .join("---\n");
+  let files = samples.iter().map(|&(file, _, _, _, source, _)| (file, source)).collect::<Vec<_>>();
+  let case = Case::new("additional-languages", &rules, &files);
+  let stream = case.run_with("stream", &["--fail-on-skipped"]);
+  assert_eq!(stream.code, 0, "{}", stream.stderr);
+  assert_eq!(stream.lines.len(), samples.len(), "{:?}", stream.lines);
+  for (file, _, name, _, _, captured) in samples {
+    let found = stream.lines.iter().find(|line| line["file"] == format!("src/{file}")).unwrap();
+    assert_eq!(found["language"], name);
+    assert_eq!(found["ruleId"], name);
+    assert_eq!(found["metaVariables"]["single"]["VALUE"]["text"], captured);
+  }
+  let fast = case.run_with("stream", &["--parser=fast", "--fail-on-skipped"]);
+  assert_eq!(fast.code, 0, "{}", fast.stderr);
+  assert_eq!(fast.lines, stream.lines);
+}
+
+#[test]
 fn skipped_inputs_are_reported_even_on_a_warm_cache() {
   let case = Case::new("scan-skips", &rule("log", "JavaScript", "rule:\n  pattern: console.log($X)"), &[("good.js", "console.log(1);\n")]);
   std::fs::write(case.dir.join("src/non-utf8.js"), b"console.log(2);\n// \xff").unwrap();
@@ -171,6 +201,85 @@ fn relational_rules_follow_stop_by_and_field() {
   let labelled = run.lines.iter().find(|l| l["ruleId"] == "await-in-fn").unwrap();
   assert_eq!(labelled["labels"][1]["style"], "secondary");
   assert!(labelled["metaVariables"]["multi"]["secondary"].is_array());
+}
+
+#[test]
+fn cypher_nested_exists_filters_the_returned_ast_node() {
+  let rules = [
+    rule(
+      "loop-without-await",
+      "JavaScript",
+      "cypher: |
+  MATCH (f:function_declaration)
+  WHERE EXISTS {
+    MATCH (f)-[:DESCENDANT]->(l:for_statement)
+    WHERE NOT EXISTS { MATCH (l)-[:DESCENDANT]->(:await_expression) }
+  } AND EXISTS { MATCH (f)-[:CHILD]->(:identifier) }
+    AND NOT EXISTS { MATCH (f)-[:CHILD]->(:await_expression) }
+  RETURN f",
+    ),
+    rule("call", "JavaScript", "rule:\n  pattern: work()"),
+  ]
+  .join("---\n");
+  let good = "async function good() { for (;;) { work(); } for (;;) { work(); } for (;;) { await work(); } }";
+  let bad = "async function bad() { for (;;) { await work(); } }";
+  let no_loop = "async function noLoop() { await work(); }";
+  let input = format!("{no_loop}\n{bad}\n{good}\n");
+  let case = Case::new("cypher-exists", &rules, &[("main.js", &input)]);
+  let run = case.run_with("stream", &["--fail-on-skipped"]);
+  assert_eq!(run.code, 0, "{}", run.stderr);
+  let cypher: Vec<_> = run.lines.iter().filter(|l| l["ruleId"] == "loop-without-await").collect();
+  assert_eq!(cypher.len(), 1);
+  assert_eq!(cypher[0]["text"], good);
+  assert_eq!(cypher[0]["labels"].as_array().unwrap().len(), 1);
+  assert_eq!(run.lines.iter().filter(|l| l["ruleId"] == "call").count(), 5);
+  let fast = case.run_with("stream", &["--parser=fast", "--fail-on-skipped"]);
+  assert_eq!(fast.code, 0, "{}", fast.stderr);
+  assert_eq!(fast.lines, run.lines);
+}
+
+#[test]
+fn cypher_rejects_unsupported_bindings_and_mixed_matchers() {
+  let cases = [
+    ("MATCH (f:function_declaration) WHERE EXISTS { MATCH (f)-[:CHILD]->(f:identifier) } RETURN f", "already bound"),
+    ("MATCH (f:function_declaration) WHERE EXISTS { MATCH (x)-[:CHILD]->(:identifier) } RETURN f", "enclosing variable"),
+    ("MATCH (f:function_declaration) WHERE EXISTS { MATCH (f)-[:PARENT]->(:identifier) } RETURN f", "CHILD or DESCENDANT"),
+    ("MATCH (f:function_declaration) RETURN x", "RETURN must use `f`"),
+    ("MATCH (f:no_such_kind) RETURN f", "unknown AST kind `no_such_kind`"),
+    ("MATCH (f:function_declaration) RETURN f\nrule: {kind: function_declaration}", "use either `rule` or `cypher`"),
+    (
+      "MATCH (call:call_expression) WHERE PATTERN(\"log($VALUE)\") RETURN call\nconstraints:\n  MISSING: {kind: identifier}",
+      "constraint `MISSING` needs a single capture in PATTERN",
+    ),
+  ];
+  for (index, (query, diagnostic)) in cases.into_iter().enumerate() {
+    let rules = rule("bad-query", "JavaScript", &format!("cypher: |\n  {query}"));
+    let case = Case::new(&format!("bad-cypher-{index}"), &rules, &[("main.js", "function f() {}")]);
+    let run = case.run("stream");
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(run.lines.is_empty());
+    assert!(run.stderr.contains("bad-query") && run.stderr.contains(diagnostic), "{}", run.stderr);
+  }
+}
+
+#[test]
+fn cypher_captures_arguments_and_checks_child_fields() {
+  let rules = rule(
+    "log-value",
+    "TypeScript",
+    r#"cypher: |
+  MATCH (call:call_expression)
+  WHERE PATTERN("$LOGGER($VALUE)")
+    AND EXISTS { MATCH (call)-[:CHILD {field: "function"}]->(:identifier) }
+  RETURN call
+constraints:
+  VALUE: { kind: identifier }"#,
+  );
+  let case = Case::new("cypher-captures", &rules, &[("main.ts", "log(é); log(1); logger.log(é); log(1, 2);")]);
+  let run = case.run("stream");
+  assert_eq!(run.code, 0, "{}", run.stderr);
+  assert_eq!(texts(&run), ["log(é)"]);
+  assert_eq!(run.lines[0]["metaVariables"]["single"]["VALUE"]["text"], "é");
 }
 
 #[test]

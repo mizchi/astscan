@@ -73,8 +73,8 @@ struct Builtin {
   ts: fn() -> Language,
 }
 
-/// ast-grep's built-in languages, in its own order: the order an extension
-/// is resolved in, with the expando character each one needs.
+/// ast-grep 0.45.3's built-ins in extension-resolution order, followed by
+/// the additional grammars bundled with astscan.
 const BUILTINS: &[Builtin] = &[
   Builtin {
     name: "Bash",
@@ -158,6 +158,17 @@ const BUILTINS: &[Builtin] = &[
     ts: || tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
   },
   Builtin { name: "Yaml", aliases: &["yaml", "yml"], exts: &["yaml", "yml"], expando: '$', ts: || tree_sitter_yaml::LANGUAGE.into() },
+  Builtin { name: "MoonBit", aliases: &["moonbit", "mbt"], exts: &["mbt"], expando: 'µ', ts: || tree_sitter_moonbit::LANGUAGE.into() },
+  Builtin { name: "Sql", aliases: &["sql"], exts: &["sql"], expando: '_', ts: || tree_sitter_sequel::LANGUAGE.into() },
+  Builtin { name: "Toml", aliases: &["toml"], exts: &["toml"], expando: '_', ts: || tree_sitter_toml::LANGUAGE.into() },
+  Builtin {
+    name: "Xml",
+    aliases: &["xml"],
+    exts: &["xml", "svg", "xsd", "xsl"],
+    expando: 'z',
+    ts: || tree_sitter_xml::LANGUAGE_XML.into(),
+  },
+  Builtin { name: "Zig", aliases: &["zig"], exts: &["zig"], expando: '_', ts: || tree_sitter_zig::LANGUAGE.into() },
 ];
 
 /// A grammar declared in `sgconfig.yml`'s `customLanguages`.
@@ -210,6 +221,9 @@ impl Registry {
 
   /// Built-in names and aliases are case-insensitive; a declared language is its exact name.
   pub(crate) fn resolve(&mut self, name: &str) -> Option<Arc<Lang>> {
+    if let Some(lang) = self.custom.iter().find(|l| l.name == name) {
+      return Some(lang.clone());
+    }
     for b in BUILTINS {
       if b.aliases.iter().any(|a| name.eq_ignore_ascii_case(a)) {
         let lang = self
@@ -219,7 +233,7 @@ impl Registry {
         return Some(lang.clone());
       }
     }
-    self.custom.iter().find(|l| l.name == name).cloned()
+    None
   }
 
   #[cfg(feature = "internals")]
@@ -333,5 +347,20 @@ impl HtmlInjections {
       });
     }
     out
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn a_declared_grammar_keeps_its_exact_name_and_extension_after_bundling() {
+    let declared = Arc::new(Lang::new("moonbit", tree_sitter_moonbit::LANGUAGE.into(), 'µ', '$', vec!["mbt".into()], None));
+    let mut registry = Registry { custom: vec![declared.clone()], ..Registry::default() };
+
+    assert!(Arc::ptr_eq(&registry.resolve("moonbit").unwrap(), &declared));
+    assert_eq!(registry.name_for_path(Path::new("main.mbt")), Some("moonbit"));
+    assert_eq!(registry.resolve("MoonBit").unwrap().name, "MoonBit");
   }
 }

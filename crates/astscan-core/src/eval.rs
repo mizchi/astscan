@@ -71,6 +71,7 @@ pub struct Matcher<'a> {
   pub src: &'a str,
   pub utils: &'a [Rule],
   pub regexes: &'a [regex::Regex],
+  pub cypher_hits: &'a [Vec<u32>],
 }
 
 impl<'a> Matcher<'a> {
@@ -110,6 +111,7 @@ impl<'a> Matcher<'a> {
   pub fn eval(&self, rule: &Rule, n: u32, env: &mut Env) -> Option<u32> {
     match rule {
       Rule::Kind(k) => (self.kind(n) == *k).then_some(n),
+      Rule::Cypher(step) => (self.kind(n) == step.kind && step.matches(n, self.t, self.cypher_hits)).then_some(n),
       Rule::Pattern(p) => self.match_pattern(p, n, env).then_some(n),
       Rule::Regex(index) => self.regexes[*index].is_match(self.text(n)).then_some(n),
       Rule::NthChild(nc) => self.nth_child(nc, n, env),

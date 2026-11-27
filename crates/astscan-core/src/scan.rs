@@ -1,6 +1,7 @@
 //! Parse, flatten, and run all applicable rule groups over one source.
 
 use crate::config::{RuleInfo, RuleSet, Unit};
+use crate::cypher;
 use crate::eval::{Env, Matcher};
 use crate::fastparse::Parser as FastParser;
 use crate::found::{Found, Span};
@@ -186,6 +187,7 @@ pub struct Scanner<'a> {
   env: Env,
   local_regexes: Vec<Option<Vec<regex::Regex>>>,
   prefilter: PrefilterScratch,
+  cypher_hits: Vec<Vec<u32>>,
   newlines: Vec<u32>,
   found: Found,
 }
@@ -222,6 +224,7 @@ impl<'a> Scanner<'a> {
       env: Env::default(),
       local_regexes: rules.units.iter().map(|_| None).collect(),
       prefilter: PrefilterScratch::default(),
+      cypher_hits: Vec::new(),
       newlines: Vec::new(),
       found: Found::default(),
     }
@@ -383,6 +386,7 @@ impl<'a> Scanner<'a> {
       &unit.regexes
     };
     let rejected = if rejected_groups == 0 { None } else { Some(self.prefilter.rejected()) };
+    let cypher_hits = if unit.cypher_steps.is_empty() { &[][..] } else { cypher::evaluate(&unit.cypher_steps, t, &mut self.cypher_hits) };
     let span = |n: u32| -> Span { (t.start[n as usize], t.end[n as usize]) };
     for n in 0..t.len() as u32 {
       let Some(groups) = unit.kind_map.get(t.kind[n as usize] as usize) else { continue };
@@ -392,7 +396,7 @@ impl<'a> Scanner<'a> {
         }
         let group = &unit.groups[g as usize];
         self.env.clear();
-        let m = Matcher { t, src, utils: &group.core.utils, regexes };
+        let m = Matcher { t, src, utils: &group.core.utils, regexes, cypher_hits };
         let Some(node) = m.match_core(&group.core, n, &mut self.env) else { continue };
         let (env, f) = (&self.env, &mut self.found);
         f.clear();

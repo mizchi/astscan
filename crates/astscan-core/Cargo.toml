@@ -13,8 +13,8 @@ include = ["/src/**", "/tests/**", "/csrc/**", "/build.rs", "/README.md", "/LICE
 internals = []
 
 [dependencies]
-# The grammars and their versions are the ones ast-grep 0.45.3 was built
-# with: the same parser is what makes the same rule match the same nodes.
+# Grammars shared with ast-grep 0.45.3 use its versions so matching sees
+# the same syntax trees.
 tree-sitter = "=0.27.0"
 tree-sitter-bash = "=0.25.1"
 tree-sitter-c = "=0.24.2"
@@ -43,6 +43,12 @@ tree-sitter-solidity = "=1.2.13"
 tree-sitter-swift = "=0.7.3"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-yaml = "=0.7.2"
+# Additional bundled grammars.
+tree-sitter-moonbit = "=0.1.0"
+tree-sitter-sequel = "=0.3.13"
+tree-sitter-toml = { version = "=0.7.0", package = "tree-sitter-toml-ng" }
+tree-sitter-xml = "=0.7.0"
+tree-sitter-zig = "=1.1.2"
 serde = "1"
 serde_yaml = "0.9"
 serde_json = "1"

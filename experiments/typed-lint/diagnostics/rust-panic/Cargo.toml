@@ -1,0 +1,12 @@
+[package]
+name = "astscan-panic-trace"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+backtrace = "0.3.77"
+serde = { version = "1", features = ["derive"] }

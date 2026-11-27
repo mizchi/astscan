@@ -16,7 +16,33 @@ Apple M5, 10 cores, wall time, mean of 5 runs after a warm-up, output to
 Peak memory on playwright is 2.6 GB for ast-grep, 349 MB for astscan `stream`
 and 180 MB for `slim`.
 
-Where the time went, and what was done about it:
+### Release candidate spot check
+
+The astscan 0.1.0 release candidate (`d03d1fb`) and ast-grep 0.45.3
+returned the same 48,829 matches, field for field in `stream` mode, on
+Go 1.27.3's `src/net`. The scan used jev-lint's 14 Go rules.
+Measurement on an Apple M5 with macOS 26.6.2 used hyperfine 2.0.0,
+4 threads per command, 3 warm-ups and 15 timed runs, and stdout sent
+to `/dev/null`. astscan used its default parser and did not use a result cache.
+
+| Command | Mean wall time ± standard deviation | Speedup |
+| --- | ---: | ---: |
+| ast-grep `stream` | 182.5 ± 6.6 ms | 1× |
+| astscan `stream` | 85.9 ± 0.7 ms | 2.1× |
+| astscan `slim` | 79.8 ± 1.6 ms | 2.3× |
+
+Set `AST_GREP`, `ASTSCAN`, and `GO_RULES` to absolute paths. The Go-only YAML
+used here has SHA-256 `3e8e51a8ade6c7c55922a7067d78179ab6284013c751f95cf25ae39f8cdd7ae1`.
+
+```sh
+cd "$(go env GOROOT)/src/net"
+hyperfine --warmup 3 --runs 15 --output null \
+  "\"$AST_GREP\" scan --rule \"$GO_RULES\" --json=stream --threads 4 -- ." \
+  "\"$ASTSCAN\" scan --rule \"$GO_RULES\" --json=stream --threads 4 -- ." \
+  "\"$ASTSCAN\" scan --rule \"$GO_RULES\" --json=slim --threads 4 -- ."
+```
+
+### Implementation
 
 - **One tree walk per file, not one per rule.** The tree-sitter tree is
   flattened once into pre-order arrays (`crates/astscan-core/src/tree.rs`). Every node is one

@@ -1,0 +1,12 @@
+id: entry
+language: TypeScript
+cypher: |
+  MATCH (f:function_declaration) RETURN f
+---
+id: recorded-value
+language: TypeScript
+cypher: |
+  MATCH (call:call_expression)
+  WHERE PATTERN("$CALLEE($VALUE)")
+    AND EXISTS { MATCH (call)-[:CHILD {field: "arguments"}]->(:arguments) }
+  RETURN call

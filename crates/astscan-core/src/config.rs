@@ -9,9 +9,10 @@
 //! into one `Group`: the matcher runs once per node and the match is reported
 //! under every id in the group.
 
+use crate::cypher;
 use crate::lang::{CustomDecl, Lang, Registry};
 use crate::prefilter::Prefilter;
-use crate::rule::{Interner, RuleCore, compile_core};
+use crate::rule::{Interner, KindSet, Rule, RuleCore, compile_core};
 use serde_yaml::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -58,6 +59,7 @@ pub struct Unit {
   pub(crate) var_names: Vec<String>,
   pub(crate) regexes: Vec<regex::Regex>,
   pub(crate) prefilter: Option<Prefilter>,
+  pub(crate) cypher_steps: Vec<cypher::Step>,
 }
 
 #[cfg(feature = "internals")]
@@ -83,7 +85,7 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-  /// Compile ast-grep rules from a multi-document YAML string.
+  /// Compile ast-grep `rule` or astscan `cypher` documents from a YAML string.
   pub fn compile(yaml: &str, registry: &mut Registry) -> Result<Self, String> {
     plan_yaml(yaml, "YAML", registry)?.compile()
   }
@@ -163,7 +165,7 @@ pub unsafe fn load_sgconfig(path: &Path, registry: &mut Registry) -> Result<(), 
 }
 
 const IGNORED_FIELDS: &[&str] =
-  &["id", "language", "rule", "constraints", "utils", "message", "severity", "note", "url", "metadata", "labels", "fix"];
+  &["id", "language", "rule", "cypher", "constraints", "utils", "message", "severity", "note", "url", "metadata", "labels", "fix"];
 const UNSUPPORTED_FIELDS: &[&str] = &["transform", "rewriters", "files", "ignores"];
 
 /// One rule, read and checked but not compiled.
@@ -220,8 +222,14 @@ fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry)
     };
     let lang_name = doc.get("language").and_then(|v| v.as_str()).ok_or_else(|| fail("a rule needs a `language`".into()))?;
     let lang = registry.resolve(lang_name).ok_or_else(|| fail(format!("{lang_name} is not supported!")))?;
-    if doc.get("rule").is_none() {
-      return Err(fail("a rule needs a `rule`".into()));
+    match (doc.get("rule"), doc.get("cypher")) {
+      (Some(_), Some(_)) | (None, None) => return Err(fail("use either `rule` or `cypher`".into())),
+      (None, Some(query)) => {
+        if !query.is_string() {
+          return Err(fail("`cypher` must be a string".into()));
+        }
+      }
+      (Some(_), None) => {}
     }
 
     let meta = RuleInfo {
@@ -316,23 +324,55 @@ fn compile_unit(lang: &Arc<Lang>, pending: Vec<(usize, Pending)>) -> Result<(Uni
     var_names: Vec::new(),
     regexes: Vec::new(),
     prefilter: None,
+    cypher_steps: Vec::new(),
   };
   let mut group_index: HashMap<String, usize> = HashMap::new();
   let mut warnings = Vec::new();
 
   for (index, Pending { doc, meta, .. }) in pending {
     let fail = |e: String| (index, format!("Cannot parse rule {}: {e}", meta.id));
-    let rule = doc.get("rule").expect("checked when the rule was read");
+    let query = doc.get("cypher");
     let (constraints, utils) = (doc.get("constraints"), doc.get("utils"));
+    let rule = doc.get("rule");
 
     // Same grammar and same matcher: one evaluation, reported under every id.
     let null = Value::Null;
-    let key = serde_json::to_string(&[rule, constraints.unwrap_or(&null), utils.unwrap_or(&null)]).map_err(|e| fail(e.to_string()))?;
+    let key = serde_json::to_string(&[query.or(rule).unwrap_or(&null), constraints.unwrap_or(&null), utils.unwrap_or(&null)])
+      .map_err(|e| fail(e.to_string()))?;
+    let key = if query.is_some() { format!("cypher:{key}") } else { key };
     if let Some(&g) = group_index.get(&key) {
       unit.groups[g].metas.push(meta);
       continue;
     }
-    let core = compile_core(rule, constraints, utils, lang, &mut vars, &mut unit.regexes).map_err(fail)?;
+    let core = match query {
+      Some(query) => {
+        let query = query.as_str().expect("checked when the rule was read");
+        let (step, pattern) = cypher::compile(query, lang, &mut unit.cypher_steps).map_err(fail)?;
+        let kinds = Some(KindSet::one(step.kind));
+        let shape = Rule::Cypher(Box::new(step));
+        if let Some(pattern) = pattern {
+          let pattern = Value::Mapping([(Value::String("pattern".into()), Value::String(pattern))].into_iter().collect());
+          let mut core = compile_core(&pattern, constraints, utils, lang, &mut vars, &mut unit.regexes).map_err(fail)?;
+          let Rule::Pattern(pattern) = &core.rule else { unreachable!("compiled one pattern") };
+          for &(id, _) in &core.constraints {
+            if !pattern.node.has_single_capture(id) {
+              return Err(fail(format!("constraint `{}` needs a single capture in PATTERN", vars.names[id as usize])));
+            }
+          }
+          core.rule = Rule::All(vec![shape, core.rule], None);
+          core.kinds = kinds;
+          core
+        } else {
+          if constraints.is_some() || utils.is_some() {
+            return Err(fail("`constraints` and `utils` in a Cypher rule require `PATTERN`".into()));
+          }
+          RuleCore { rule: shape, kinds, constraints: Vec::new(), utils: Vec::new() }
+        }
+      }
+      None => {
+        compile_core(rule.expect("checked when the rule was read"), constraints, utils, lang, &mut vars, &mut unit.regexes).map_err(fail)?
+      }
+    };
     let g = unit.groups.len();
     match &core.kinds {
       Some(kinds) => {

@@ -7,7 +7,7 @@ const require = createRequire(import.meta.url);
 
 // The scanner emits UTF-8 byte ranges. TypeScript nodes use UTF-16 offsets.
 // Convert just the requested offsets in one forward pass over the source.
-function positions(bytes, byteOffsets, bom) {
+export function positions(bytes, byteOffsets, bom) {
   const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
   const offsets = new Map();
   let byte = bom;
@@ -19,6 +19,11 @@ function positions(bytes, byteOffsets, bom) {
     byte = next;
   }
   return offsets;
+}
+
+export function compilerTextOffset(bytes, text) {
+  const bom = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && text.charCodeAt(0) !== 0xfeff ? 3 : 0;
+  return bytes.subarray(bom).equals(Buffer.from(text)) ? bom : undefined;
 }
 
 function* awaitable(TypeFlags, checker, type) {
@@ -40,8 +45,8 @@ function* awaitable(TypeFlags, checker, type) {
 }
 
 function collectCalls({ isCallExpression, isExpressionStatement }, source, bytes, candidates, calls) {
-  const bom = bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf && source.text.charCodeAt(0) !== 0xfeff ? 3 : 0;
-  if (!bytes.subarray(bom).equals(Buffer.from(source.text))) return;
+  const bom = compilerTextOffset(bytes, source.text);
+  if (bom === undefined) return;
   const offsets = positions(bytes, candidates.flatMap(({ range }) => [range.start, range.end]), bom);
   const byStart = Map.groupBy(candidates, ({ range }) => offsets.get(range.start));
 

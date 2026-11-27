@@ -2,6 +2,9 @@
   "name": "astscan-typed-lint-experiment",
   "private": true,
   "devDependencies": {
-    "tsrs": "7.1.0-beta.tsrs5"
+    "@jridgewell/trace-mapping": "0.3.31",
+    "error-stack-parser": "2.1.4",
+    "tsrs": "7.1.0-beta.tsrs5",
+    "vscode-jsonrpc": "10.0.2"
   }
 }

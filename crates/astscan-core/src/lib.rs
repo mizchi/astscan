@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 mod config;
+mod cypher;
 mod eval;
 mod fastparse;
 mod found;

@@ -20,12 +20,12 @@ use std::sync::{Mutex, OnceLock};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const USAGE: &str = "\
-astscan: run ast-grep rules over a source tree, extraction only
+astscan: structural search over a source tree
 
 Usage: astscan scan --rule <FILE> [OPTIONS] [--] [PATHS]...
 
 Options:
-  -r, --rule <FILE>     Rule file: ast-grep rules as multi-document YAML
+  -r, --rule <FILE>     Multi-document YAML with ast-grep rules or Cypher queries
   -c, --config <FILE>   sgconfig.yml, read for `customLanguages`
       --json[=<STYLE>]  stream: ast-grep's JSON lines (default)
                         slim:   one line per match, no source text, all rule ids

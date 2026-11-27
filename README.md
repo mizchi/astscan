@@ -3,6 +3,14 @@
 Fast multi-rule structural code search using [ast-grep](https://github.com/ast-grep/ast-grep)
 rules. It implements the extraction half of `ast-grep scan`.
 
+Across five corpora with jev-lint's 207 rules on an Apple M5, astscan was
+**2.6–14× faster than ast-grep 0.45.3** with compatible `--json=stream`
+output. On Wasmtime, wall time went from **21.6 s to 1.54 s**. With
+astscan's compact `--json=slim` output, the same scan took 0.43 s, about
+**50× faster** than the ast-grep baseline. A separate astscan 0.1.0 spot
+check on Go's `net` package measured **2.1×** with identical stream matches.
+[Benchmark conditions and full results](https://github.com/mizchi/astscan/blob/main/docs/performance.md).
+
 - [`astscan-core`](https://github.com/mizchi/astscan/tree/main/crates/astscan-core) is the Rust library. It compiles
   rule YAML once and returns structured matches from in-memory source.
 - `astscan` is the CLI. It finds source files, scans them in parallel,
@@ -90,14 +98,71 @@ Supported: `pattern` (string, or `context` / `selector` / `strictness`),
 `kind`, `regex`, `nthChild`, `inside` / `has` / `precedes` / `follows` with
 `stopBy` and `field`, `all` / `any` / `not` / `matches`, `constraints`, local
 `utils`, `ast-grep-ignore` comments, scripts and styles embedded in HTML, and
-`customLanguages` from an `sgconfig.yml` passed with `-c`. The built-in
-grammars are ast-grep's 28, pinned to the versions ast-grep 0.45.3 was built
-with.
+`customLanguages` from an `sgconfig.yml` passed with `-c`.
 
 Not supported, and rejected with an error rather than ignored: `transform`,
 `rewriters`, `files` / `ignores`, `range`, selector syntax in `kind`,
 parameterized `matches`, and global utility rules. `fix` and `labels` are
 accepted and ignored. Metavariables in `message` are not expanded.
+
+## Cypher queries
+
+Use an astscan `cypher` rule to check for nested AST relationships. This
+JavaScript rule reports each function with a `for` loop containing no `await`.
+
+```yaml
+id: loop-without-await
+language: JavaScript
+severity: warning
+cypher: |
+  MATCH (f:function_declaration)
+  WHERE EXISTS {
+    MATCH (f)-[:DESCENDANT]->(loop:for_statement)
+    WHERE NOT EXISTS { MATCH (loop)-[:DESCENDANT]->(:await_expression) }
+  }
+  RETURN f
+```
+
+Pass the file to `astscan scan --rule rules.yml -- src`. The file can also
+contain ast-grep `rule` documents separated by `---`. `RuleSet::compile`
+accepts the same YAML in Rust.
+
+The subset supports `MATCH (name:kind)`, `RETURN name`, and nested `EXISTS`
+and `NOT EXISTS` predicates joined by `AND`. The `CHILD` and `DESCENDANT`
+edges follow the syntax tree from the enclosing variable. `DESCENDANT`
+includes nested scopes and excludes the enclosing node itself. A match
+reports the outer node once, regardless of the number of inner matches.
+Each document uses either `cypher` or `rule`. Cross-file joins, symbol and
+type predicates, and Cypher aggregation are outside the core's structural subset.
+
+Start the outer `WHERE` with `PATTERN("$CALLEE($VALUE)")` to reuse
+ast-grep pattern syntax and emit captures. Use the document's `constraints`
+to filter those captures. `[:CHILD {field: "arguments"}]` restricts a direct
+edge to a named Tree-sitter field.
+
+The [TypeScript audit experiment](https://github.com/mizchi/astscan/tree/main/experiments/typed-lint#audit-with-data-flow)
+uses those captures for symbol-aware, cross-file data flow and diagnostics.
+
+## Languages
+
+astscan bundles 33 grammars. The 28 shared with ast-grep 0.45.3 use the
+grammar versions from that release. The five additions are available
+directly in rule YAML and are selected by extension during directory scans.
+
+| Rule `language` | Extensions |
+| --- | --- |
+| `MoonBit` | `.mbt` |
+| `Zig` | `.zig` |
+| `Toml` | `.toml` |
+| `Sql` | `.sql` |
+| `Xml` | `.xml`, `.svg`, `.xsd`, `.xsl` |
+
+Bundled language names are case-insensitive. An exact declared
+`customLanguages` name takes precedence over a bundled name, so an existing
+MoonBit grammar declaration continues to work. SQL uses the
+[tree-sitter SQL grammar](https://github.com/DerekStride/tree-sitter-sql).
+For a statement pattern such as `SELECT id FROM $TABLE`, omit the terminal
+semicolon so the pattern selects one AST node.
 
 ## Output
 
