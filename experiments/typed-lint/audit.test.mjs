@@ -108,3 +108,56 @@ test("an empty candidate batch is lazy and lists missing entry coverage", () => 
     audit.close();
   }
 });
+
+test("local arrays keep index precision through iteration and standard callbacks", () => {
+  const workspace = mkdtempSync(join(tmpdir(), "astscan-array-audit-"));
+  const audit = createTypeScriptAudit(join(workspace, "tsconfig.json"));
+  try {
+    cpSync(fixture, workspace, { recursive: true });
+    writeFileSync(join(workspace, "app.ts"), `
+      import { input as read, record as log, mask } from "./apis";
+      function pass(value: string) { return value; }
+      export function atIndex() { const xs = [read(), "safe"]; log(xs[0]); }
+      export function otherIndex() { const xs = [read(), "safe"]; log(xs[1]); }
+      export function aliasOverwrite() { const xs = [read()]; const alias = xs; alias[0] = "safe"; log(xs[0]); }
+      export function unknownIndex(index: number) { const xs = ["safe", read()]; log(xs[index]); }
+      export function forOf() { for (const value of [read()]) log(value); }
+      export function forOfLater() { for (const value of ["safe", read()]) log(value); }
+      export function breaksEarly() { for (const value of ["safe", read()]) { log(value); break; } }
+      export function empty() { for (const value of [] as string[]) log(read()); }
+      export function each() { [read()].forEach((value) => { log(value); }); }
+      export function eachEmpty() { ([] as string[]).forEach(() => log(read())); }
+      export function throughMap() { const xs = [read(), "safe"].map(pass); log(xs[0]); }
+      export function otherMapIndex() { const xs = [read(), "safe"].map((value) => value); log(xs[1]); }
+      export function mappedMask() { const xs = [read()].map((value) => mask(value)); log(xs[0]); }
+      export function customMethod() {
+        const xs = [read()] as unknown as { forEach(fn: (value: string) => void): void };
+        xs.forEach((value) => log(value));
+      }
+      export function spread(values: string[]) { const xs = [...values, read()]; log(xs[0]); }
+      export function capturedLocal() { const captured = read(); ["value"].forEach(() => log(captured)); }
+      export function unknownCallback() { [read()].forEach(notDeclared); }
+    `);
+    const matches = scan(astscan, workspace, "audit/fixture/candidates.yml", ["app.ts"]);
+    const result = audit.check("array-fixture", matches, policy, complete);
+    const arrayChecks = checks(result);
+    for (const name of ["atIndex", "unknownIndex", "forOf", "forOfLater", "each", "throughMap"]) assert.equal(arrayChecks[name].exists, true, name);
+    for (const name of ["otherIndex", "aliasOverwrite", "breaksEarly", "empty", "eachEmpty", "otherMapIndex", "mappedMask"]) {
+      assert.equal(arrayChecks[name].exists, false, name);
+    }
+    for (const name of ["customMethod", "spread", "capturedLocal", "unknownCallback"]) assert.equal(arrayChecks[name].exists, null, name);
+    assert.equal(result.diagnostics.length, 6);
+    const mapping = result.diagnostics.find(({ data }) => readAt(data.entry).includes("function throughMap"));
+    assert(mapping.evidence.some(({ kind }) => kind === "return"));
+    assert(mapping.evidence.some(({ kind }) => kind === "element"));
+    const negated = checks(audit.check("array-fixture", matches, { ...policy, query: "NOT EXISTS" }, complete));
+    assert.equal(negated.spread.matched, null);
+    assert.equal(negated.otherIndex.matched, true);
+    const capped = checks(audit.check("array-fixture", matches, { ...policy, query: "NOT EXISTS" }, { ...complete, loops: 1 }));
+    assert.equal(capped.forOfLater.matched, null);
+    assert(capped.forOfLater.issues.some(({ code }) => code === "loop-limit"));
+  } finally {
+    audit.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});

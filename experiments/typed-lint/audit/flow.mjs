@@ -79,6 +79,7 @@ export function auditFunction(facts, root, rule, captures, limits) {
   const active = new Set();
   const issues = new Map();
   const modelCache = new Map();
+  const arrayLengths = new Map();
   let remaining = limits.steps;
   let loopDepth = 0;
 
@@ -114,13 +115,39 @@ export function auditFunction(facts, root, rule, captures, limits) {
     return call.questionDotToken || call.expression.questionDotToken ? undefined : facts.callee(call.expression);
   }
 
+  function allocate(node, kind) {
+    if (loopDepth) issue(node, "loop-allocation", "Repeated allocation at this site can create distinct object identities.");
+    return `${kind}:${node.id}`;
+  }
+
+  function arrayOf(input) {
+    const length = arrayLengths.get(input.ref);
+    if (length !== undefined) return { ref: input.ref, length };
+  }
+
+  function arrayAccess(node, state, depth) {
+    const array = arrayOf(expression(node.expression, state, depth + 1));
+    const indexNode = node.argumentExpression;
+    expression(indexNode, state, depth + 1);
+    if (!array || !indexNode || node.questionDotToken || state.stopped) return;
+    if (!ast.isNumericLiteral(indexNode)) {
+      if (facts.typeIs(indexNode, "number") === true) return array;
+      return;
+    }
+    const index = Number(indexNode.text);
+    if (Number.isSafeInteger(index) && index >= 0) return { ...array, index };
+  }
+
   function slot(node, state, depth) {
     if (ast.isIdentifier(node)) {
       const id = facts.symbol(node)?.id;
       if (id !== undefined && state.locals.has(id)) return { map: state.locals, key: id };
     } else if (ast.isPropertyAccessExpression(node) && !node.questionDotToken) {
       const ref = expression(node.expression, state, depth + 1).ref;
-      if (ref !== undefined) return { map: state.fields, key: `${ref}.${node.name.text}` };
+      if (ref !== undefined && !arrayLengths.has(ref)) return { map: state.fields, key: `${ref}.${node.name.text}` };
+    } else if (ast.isElementAccessExpression(node)) {
+      const site = arrayAccess(node, state, depth);
+      if (site && site.index !== undefined && site.index < site.length) return { map: state.fields, key: `${site.ref}.${site.index}` };
     }
     return undefined;
   }
@@ -162,9 +189,42 @@ export function auditFunction(facts, root, rule, captures, limits) {
   const eventStack = [];
   const callStack = [];
 
+  function arrayCall(node, method, state, depth) {
+    const array = arrayOf(expression(node.expression.expression, state, depth + 1));
+    if (state.stopped) return clean;
+    const arg = node.arguments.length === 1 && unparenthesized(node.arguments[0]);
+    const callback = arg && (ast.isArrowFunction(arg) || ast.isFunctionExpression(arg)
+      ? arg
+      : ast.isIdentifier(arg) && facts.definition(facts.callee(arg)));
+    if (!array || !callback?.body || callback.parameters.length > 1 || isAsync(callback) || callback.asteriskToken) {
+      issue(node, "unsupported-array-call", "Expected a local array and one synchronous callback accepting at most one parameter.");
+      return clean;
+    }
+
+    const ref = method === "map" ? allocate(node, "array") : undefined;
+    for (let index = 0; index < array.length; index++) {
+      if (index === limits.loops) {
+        issue(node, "loop-limit", "The array method reached its iteration budget.");
+        return clean;
+      }
+      if (spent(node, depth)) return clean;
+      const element = fieldValue(state, `${array.ref}.${index}`);
+      const result = applyCall(node, state, depth, callback, [element]);
+      if (state.stopped) return clean;
+      if (ref) write({ map: state.fields, key: `${ref}.${index}` }, result, node, "element");
+    }
+    if (!ref) return clean;
+    arrayLengths.set(ref, array.length);
+    return { ...clean, ref };
+  }
+
   function callExpression(node, state, depth, awaited = false) {
     const binding = callee(node);
     const modeled = model(binding);
+    if (!modeled && ast.isPropertyAccessExpression(node.expression)) {
+      const method = facts.standardArrayMethod(binding);
+      if (method) return arrayCall(node, method, state, depth);
+    }
     const args = [];
     for (const arg of node.arguments) {
       if (ast.isSpreadElement(arg)) {
@@ -204,6 +264,10 @@ export function auditFunction(facts, root, rule, captures, limits) {
       issue(node, "unawaited-call", "The execution and effects of this async call were not joined by await.");
       return clean;
     }
+    return applyCall(node, state, depth, definition, args);
+  }
+
+  function applyCall(node, state, depth, definition, args) {
     const summary = summarize(definition, callStack.at(-1) + 1, depth + 1);
     if (!summary) return clean;
     // Reads and return values are computed from the pre-call state. Writes
@@ -237,6 +301,19 @@ export function auditFunction(facts, root, rule, captures, limits) {
 
   function expression(node, state, depth) {
     if (!node || state.stopped || spent(node, depth)) return clean;
+    if (ast.isElementAccessExpression(node)) {
+      const site = arrayAccess(node, state, depth);
+      if (!site) {
+        if (!state.stopped) issue(node, "unresolved-index", "Expected a local array and a numeric index.");
+        return clean;
+      }
+      if (site.index !== undefined) return site.index < site.length ? fieldValue(state, `${site.ref}.${site.index}`) : clean;
+      let result = clean;
+      for (let index = 0; index < site.length && !spent(node, depth); index++) {
+        result = join(result, fieldValue(state, `${site.ref}.${index}`));
+      }
+      return result;
+    }
     if (ast.isIdentifier(node) || ast.isPropertyAccessExpression(node)) {
       const target = slot(node, state, depth);
       if (target) return target.map.get(target.key) ?? initialField(target.key);
@@ -275,9 +352,23 @@ export function auditFunction(facts, root, rule, captures, limits) {
       write(target, input, node);
       return input;
     }
+    if (ast.isArrayLiteralExpression(node)) {
+      const ref = allocate(node, "array");
+      let length = 0;
+      for (const element of node.elements) {
+        if (ast.isSpreadElement(element) || ast.isOmittedExpression(element)) {
+          issue(element, "unsupported-array", "Spread elements and holes are outside the local array model.");
+          return clean;
+        }
+        const input = expression(element, state, depth + 1);
+        if (state.stopped || remaining < 0) return clean;
+        write({ map: state.fields, key: `${ref}.${length++}` }, input, element, "element");
+      }
+      arrayLengths.set(ref, length);
+      return { ...clean, ref };
+    }
     if (ast.isObjectLiteralExpression(node)) {
-      if (loopDepth) issue(node, "loop-allocation", "Repeated allocation at this site can create distinct object identities.");
-      const ref = `object:${node.id}`;
+      const ref = allocate(node, "object");
       for (const property of node.properties) {
         if (ast.isPropertyAssignment(property) && ast.isIdentifier(property.name)) {
           const input = expression(property.initializer, state, depth + 1);
@@ -359,6 +450,21 @@ export function auditFunction(facts, root, rule, captures, limits) {
   function loop(node, state, exits, depth) {
     const counted = ast.isForStatement(node);
     const postTest = ast.isDoStatement(node);
+    let elements;
+    if (ast.isForOfStatement(node)) {
+      const array = !node.awaitModifier && arrayOf(expression(node.expression, state, depth + 1));
+      if (state.stopped) return undefined;
+      const list = node.initializer;
+      const name = ast.isVariableDeclarationList(list) && (list.flags & NodeFlags.BlockScoped) && list.declarations.length === 1
+        ? list.declarations[0].name : undefined;
+      const binding = name && ast.isIdentifier(name) ? facts.symbol(name) : undefined;
+      if (!array || !binding) {
+        issue(node, "unsupported-statement", "For-of requires a local array and a simple loop variable.");
+        return state;
+      }
+      if (!array.length) return state;
+      elements = { ...array, id: binding.id, name };
+    }
     if (counted && node.initializer) {
       if (ast.isVariableDeclarationList(node.initializer)) declareLocals(node.initializer, state, depth + 1);
       else expression(node.initializer, state, depth + 1);
@@ -372,14 +478,20 @@ export function auditFunction(facts, root, rule, captures, limits) {
       for (let iteration = 0; iteration < limits.loops; iteration++) {
         if (spent(node, depth)) return exit;
         const before = fork(head);
-        const { yes, no } = postTest ? { yes: before } : condition(test, before, depth);
+        const { yes, no } = elements || postTest ? { yes: before } : condition(test, before, depth);
         exit = merge(exit, no);
         if (!yes) return exit;
+        if (elements) write({ map: yes.locals, key: elements.id }, fieldValue(yes, `${elements.ref}.${iteration}`), elements.name, "element");
         const control = {};
         const body = statement(node.statement, yes, exits, depth + 1, control);
         exit = merge(exit, control.break);
         let back = merge(body, control.continue);
         if (!back) return exit;
+        if (elements) {
+          if (iteration + 1 === elements.length) return merge(exit, back);
+          head = back;
+          continue;
+        }
         if (postTest) {
           const split = condition(test, back, depth);
           exit = merge(exit, split.no);
@@ -393,11 +505,20 @@ export function auditFunction(facts, root, rule, captures, limits) {
         if (sameState(head, next)) return exit;
         head = next;
       }
-      issue(node, "loop-limit", "The loop reached its iteration budget before the flow facts stabilized.");
+      issue(node, "loop-limit", elements ? "The array iteration reached its element budget."
+        : "The loop reached its iteration budget before the flow facts stabilized.");
       return exit;
     } finally {
       loopDepth--;
     }
+  }
+
+  function recordReturn(node, input, state, exits) {
+    if (state.stopped) return;
+    if (input.ref?.startsWith("object:") || arrayLengths.has(input.ref)) {
+      issue(node, "unresolved-heap-return", "Returning a newly allocated object or array is outside the summary model.");
+    }
+    exits.push({ state, input: input.flows.size ? append(input, step(node, "return", "Returned from this function.")) : input });
   }
 
   function statement(node, state, exits, depth, control) {
@@ -417,7 +538,7 @@ export function auditFunction(facts, root, rule, captures, limits) {
       const taken = yes && statement(node.thenStatement, yes, exits, depth + 1, control);
       const other = no && node.elseStatement ? statement(node.elseStatement, no, exits, depth + 1, control) : no;
       return merge(taken, other);
-    } else if (ast.isForStatement(node) || ast.isWhileStatement(node) || ast.isDoStatement(node)) {
+    } else if (ast.isForStatement(node) || ast.isWhileStatement(node) || ast.isDoStatement(node) || ast.isForOfStatement(node)) {
       return loop(node, state, exits, depth);
     } else if (ast.isBreakStatement(node) || ast.isContinueStatement(node)) {
       if (!control || node.label) issue(node, "unsupported-jump", "This jump has no modeled loop target.");
@@ -427,10 +548,7 @@ export function auditFunction(facts, root, rule, captures, limits) {
       }
       return undefined;
     } else if (ast.isReturnStatement(node)) {
-      const input = expression(node.expression, state, depth + 1);
-      if (state.stopped) return undefined;
-      if (input.ref?.startsWith("object:")) issue(node, "unresolved-heap-return", "Returning a newly allocated object is outside the summary model.");
-      exits.push({ state, input: input.flows.size ? append(input, step(node, "return", "Returned from this function.")) : input });
+      recordReturn(node, expression(node.expression, state, depth + 1), state, exits);
       return undefined;
     } else if (ast.isThrowStatement(node)) {
       expression(node.expression, state, depth + 1);
@@ -473,8 +591,12 @@ export function auditFunction(facts, root, rule, captures, limits) {
       else issue(p, "unsupported-parameter", "Only simple positional parameters are modeled.");
     }
     const exits = [];
-    const fallthrough = statement(fn.body, state, exits, nesting);
-    if (fallthrough) exits.push({ state: fallthrough, input: clean });
+    if (ast.isBlock(fn.body)) {
+      const fallthrough = statement(fn.body, state, exits, nesting);
+      if (fallthrough) exits.push({ state: fallthrough, input: clean });
+    } else {
+      recordReturn(fn.body, expression(fn.body, state, nesting), state, exits);
+    }
     let returned = exits[0]?.input ?? clean;
     let final = exits[0]?.state;
     for (const exit of exits.slice(1)) {

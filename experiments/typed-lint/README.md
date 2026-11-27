@@ -110,9 +110,18 @@ calls to async functions in other files. A summary carries flows to the return
 value, observed sink arguments, and direct writes to argument fields. A call
 with no normal return path stops analysis of the calling path.
 
-Dynamic calls, indirect awaits, unawaited async functions, `for...of`,
-`for...in`, repeated allocation in a loop, and exceeded limits can leave
-coverage partial. `candidates[].issues` records the reason and location.
+Dense local array literals keep separate values per index, including through
+local aliases. In-bounds literal-index writes update one element. Reads with
+an unknown numeric index combine the possible elements. `for...of` binds a
+simple loop variable to each element in order, up to the loop budget.
+The standard `Array` and `ReadonlyArray` methods `forEach` and `map` use the
+same function summaries for synchronous callbacks with zero or one parameter.
+`map` records the callback's return at the corresponding result index.
+
+Dynamic calls, indirect awaits, unawaited async functions, unknown iterables,
+array spread and holes, writes that can change array length, callbacks that
+capture local state, repeated allocation in a loop, and exceeded limits can
+leave coverage partial. `candidates[].issues` records the reason and location.
 
 `query` defaults to `EXISTS`. For `NOT EXISTS`, a candidate matches only
 when the relevant scan and flow evaluation are complete and no qualifying path

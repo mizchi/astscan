@@ -48,6 +48,7 @@ function bindFacts({ api, ast, SymbolFlags, TypeFlags, SyntaxKind, NodeFlags }, 
   const aliases = new Map();
   const definitions = new Map();
   const declarationFiles = new Map();
+  const standardArrayMethods = new Map();
   const argumentTypes = new Map();
   const syntaxErrors = new Map();
 
@@ -90,6 +91,7 @@ function bindFacts({ api, ast, SymbolFlags, TypeFlags, SyntaxKind, NodeFlags }, 
   }
 
   function definition(binding) {
+    if (!binding) return;
     if (!definitions.has(binding.id)) {
       const body = binding.declarations
         .filter(({ kind }) => kind === SyntaxKind.FunctionDeclaration)
@@ -113,6 +115,19 @@ function bindFacts({ api, ast, SymbolFlags, TypeFlags, SyntaxKind, NodeFlags }, 
 
   return {
     ast, SyntaxKind, NodeFlags, sources, location, symbol, callee, definition,
+    standardArrayMethod(binding) {
+      if (binding?.name !== "forEach" && binding?.name !== "map") return;
+      if (!standardArrayMethods.has(binding.id)) {
+        const standard = binding.declarations.length > 0 && binding.declarations.every((handle) => {
+          const declaration = handle.resolve();
+          const owner = declaration?.parent;
+          return owner && ast.isInterfaceDeclaration(owner) && ["Array", "ReadonlyArray"].includes(owner.name.text)
+            && program.isSourceFileDefaultLibrary(declaration.getSourceFile());
+        });
+        standardArrayMethods.set(binding.id, standard ? binding.name : undefined);
+      }
+      return standardArrayMethods.get(binding.id);
+    },
     hasSyntaxErrors(node) {
       const file = node.getSourceFile().fileName;
       if (!syntaxErrors.has(file)) syntaxErrors.set(file, program.getSyntacticDiagnostics(file).length > 0);
