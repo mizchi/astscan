@@ -1,0 +1,14 @@
+id: guarded-error-evidence
+language: TypeScript
+rule:
+  kind: throw_statement
+  has:
+    kind: new_expression
+    pattern: new Error($MESSAGE)
+  inside:
+    kind: if_statement
+    field: consequence
+    stopBy: end
+    has:
+      field: condition
+      pattern: $GUARD

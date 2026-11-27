@@ -8,3 +8,6 @@ Run a probe with `cargo run --release -p astscan-experiments --bin <probe> -- â€
 | `glr_probe` | `<dir>...` | How often grammars need multiple parse stacks or error recovery |
 | `chunk_probe` | `<repo> [commits=2000] [Language,Language...]` | Chunk reuse and storage cost across versions of source files |
 | `pack_probe` | `<repo> [commits=2000]` | Compression and reconstruction cost for full versions and deltas |
+
+[Typed lint](typed-lint/) exercises structural evidence extraction and
+opt-in tsrs type queries over slim JSON matches.

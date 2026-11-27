@@ -1,0 +1,7 @@
+{
+  "name": "astscan-typed-lint-experiment",
+  "private": true,
+  "devDependencies": {
+    "tsrs": "7.1.0-beta.tsrs5"
+  }
+}

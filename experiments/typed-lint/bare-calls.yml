@@ -1,0 +1,7 @@
+id: discarded-call-candidate
+language: TypeScript
+rule:
+  kind: expression_statement
+  has:
+    kind: call_expression
+    pattern: $CALL
