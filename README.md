@@ -59,37 +59,33 @@ repository root.
 
 ## Quick Start
 
+Run an inline search from a project that contains JavaScript.
+
 ```sh
-demo="$(mktemp -d)"
-cat > "$demo/main.js" <<'JS'
-function run() {
-  for (let i = 0; i < 1; i++) console.log("hello");
-}
-JS
-astscan scan -l JavaScript -p 'console.log($ARG)' -- "$demo"
+astscan scan -l JavaScript -p 'console.log($ARG)' -- .
 ```
 
-The command returns one match with `ruleId` set to `pattern-1` and `ARG`
-capturing `"hello"`. The examples reuse this demo directory.
+Each match is a JSON line with `ruleId` set to `pattern-1` and the argument
+captured as `ARG`.
 
 ## Examples
 
 ### Run a query batch from the shell
 
 Repeat `--pattern` and `--cypher` to run several inline queries in one scan.
-This example returns `pattern-1` and `cypher-2`.
+The generated IDs `pattern-1` and `cypher-2` identify the queries in the output.
 
 ```sh
 astscan scan -l JavaScript \
   -p 'console.log($ARG)' \
-  --cypher 'MATCH (f:function_declaration) RETURN f' -- "$demo"
+  --cypher 'MATCH (f:function_declaration) RETURN f' -- .
 ```
 
 Pass a JSON array to `--rule -` to run a generated batch with explicit IDs,
 per-rule languages, and options such as constraints.
 
 ```sh
-astscan scan --rule - --json=slim --fail-on-skipped -- "$demo" <<'JSON'
+astscan scan --rule - --json=slim --fail-on-skipped -- . <<'JSON'
 [
   {
     "id": "string-log",
@@ -117,7 +113,7 @@ pattern or Cypher query. It infers the grammar from a file extension.
 Pass `--lang` to override it or to inspect source piped on stdin.
 
 ```sh
-astscan debug "$demo/main.js"
+astscan debug path/to/file.js
 printf '%s\n' 'x.y(1)' | astscan debug -l JavaScript -
 printf '%s\n' 'package demo' 'func f() { x.y(1) }' | astscan debug -l Go --json -
 ```
@@ -143,7 +139,7 @@ astscan scan -l JavaScript --cypher '
     WHERE NOT EXISTS { MATCH (loop)-[:DESCENDANT]->(:await_expression) }
   }
   RETURN f
-' -- "$demo"
+' -- .
 ```
 
 Set the `cypher` field when adding this query to a JSON or YAML batch.
@@ -171,8 +167,8 @@ uses those captures for symbol-aware, cross-file data flow and diagnostics.
 
 `--json=slim` is for a reader that already has the files. It leaves out
 source excerpts (`text`, `lines`, `labels`) and reports a match once with
-every rule ID that matched it. The function match from the batch above
-looks like this, with the temporary path shortened.
+every rule ID that matched it. A function match from the batch above can
+look like this.
 
 ```json
 {
