@@ -1,9 +1,9 @@
 [package]
 name = "astscan"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.90"
-description = "Fast multi-rule structural code search, compatible with ast-grep rule files (extraction only)"
+description = "AST search for AI agents with inline patterns, structural Cypher, and ast-grep rules"
 license = "MIT"
 repository = "https://github.com/mizchi/astscan"
 include = ["/src/**", "/tests/**", "/README.md", "/LICENSE"]
@@ -14,7 +14,7 @@ default-members = [".", "crates/astscan-core"]
 resolver = "3"
 
 [dependencies]
-astscan-core = { path = "crates/astscan-core", version = "0.1.0", features = ["internals"] }
+astscan-core = { path = "crates/astscan-core", version = "0.1.1", features = ["internals"] }
 tree-sitter = "=0.27.0"
 memmap2 = "0.9"
 zstd = { version = "0.13", default-features = false }
