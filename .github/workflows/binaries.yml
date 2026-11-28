@@ -66,8 +66,8 @@ jobs:
           cp "target/$TARGET/release/$exe" LICENSE bundle/
           if [[ "$RUNNER_OS" == Windows ]]; then
             archive="dist/astscan-$TARGET.zip"
-            tar.exe -a -cf "$archive" -C bundle "$exe" LICENSE
-            tar.exe -xf "$archive" -C smoke
+            python -m zipfile -c "$archive" "bundle/$exe" bundle/LICENSE
+            python -m zipfile -e "$archive" smoke
           else
             archive="dist/astscan-$TARGET.tar.gz"
             tar -czf "$archive" -C bundle "$exe" LICENSE
