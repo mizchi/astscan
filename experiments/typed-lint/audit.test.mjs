@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createTypeScriptAudit } from "./audit/index.mjs";
+import { append, fork, merge, parameter, sameState } from "./audit/state.mjs";
 import { scan } from "./scan.mjs";
 
 const fixture = fileURLToPath(new URL("./audit/fixture/", import.meta.url));
@@ -19,6 +21,44 @@ function readAt({ file, bytes }) {
 function checks(result) {
   return Object.fromEntries(result.candidates.map((candidate) => [readAt(candidate.location).match(/\bfunction (\w+)/)[1], candidate]));
 }
+
+test("loop convergence ignores witness growth and a join keeps the shortest witness", () => {
+  const source = append(parameter(0), { kind: "source" });
+  const head = { locals: new Map([[1, source]]), fields: new Map() };
+  const back = fork(head);
+  back.locals.set(1, append(source, { kind: "assignment" }));
+
+  assert(sameState(head, back));
+  assert.deepEqual([...merge(back, head).locals.get(1).flows.values()], [[{ kind: "source" }]]);
+});
+
+function runAuditCli(binary, inputs) {
+  return spawnSync(process.execPath, [
+    fileURLToPath(new URL("./audit/cli.mjs", import.meta.url)),
+    binary,
+    join(fixture, "tsconfig.json"), join(fixture, "candidates.yml"), join(fixture, "policy.json"),
+    ...inputs,
+  ], { encoding: "utf8", timeout: 10_000 });
+}
+
+test("audit CLI retains findings from scanned files when an input is skipped", () => {
+  const run = runAuditCli(astscan, ["app.ts", "helpers.ts", "missing-input.ts"]);
+  assert.ifError(run.error);
+  assert.equal(run.status, 2, run.stderr);
+  const batch = JSON.parse(run.stdout);
+  assert.equal(batch.coverage.state, "partial");
+  assert.equal(batch.coverage.documents[0].state, "provisional");
+  assert(batch.diagnostics.some(({ code, locations }) =>
+    code === "unmasked-log-value" && locations[0].file === join(fixture, "app.ts")));
+  assert(checks(batch).masked.issues.some(({ code }) => code === "partial-scan"));
+});
+
+test("audit CLI returns an execution error when astscan cannot start", () => {
+  const run = runAuditCli(join(fixture, "missing-astscan-binary"), ["app.ts"]);
+  assert.ifError(run.error);
+  assert.equal(run.status, 2, run.stderr);
+  assert.equal(run.stdout, "");
+});
 
 test("audit policies resolve symbols, track local and cross-file values, and explain results", () => {
   const workspace = mkdtempSync(join(tmpdir(), "astscan-audit-"));

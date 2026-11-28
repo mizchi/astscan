@@ -82,8 +82,10 @@ node experiments/typed-lint/audit/cli.mjs target/release/astscan \
 The CLI scans from the `tsconfig.json` directory and accepts optional
 project-relative inputs. It emits a diagnostic batch as JSON. Exit 0 means
 complete coverage with no matches, exit 1 means a match with complete coverage,
-and exit 2 means some coverage is partial. The fixture demonstrates both
-findings and partial coverage.
+and exit 2 means partial coverage or an execution error. If astscan skips an
+input, the batch retains findings from the inputs it scanned. Check
+`coverage.state` before using the absence of findings as a pass. The fixture
+demonstrates both findings and partial coverage.
 
 | Model `kind` | Contract |
 | --- | --- |
