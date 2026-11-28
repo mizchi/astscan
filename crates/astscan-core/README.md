@@ -1,6 +1,6 @@
 # astscan-core
 
-Fast structural code search over in-memory source with ast-grep rule YAML.
+Fast structural code search over in-memory source with ast-grep rules and Cypher.
 Compile rules once, share them across workers, and reuse one scanner per
 worker. The scanner flattens each syntax tree once and dispatches candidate
 rules by node kind. Identical matchers run once even when several rule IDs
@@ -40,6 +40,9 @@ scanner.scan("js", source, |found| {
 }).unwrap();
 assert_eq!(matches, 1);
 ```
+
+`RuleSet::compile` also accepts a JSON array of rule objects with per-rule
+`id` and `language` fields.
 
 Results borrow the scanner's buffers for the duration of the callback.
 Matches, captures, and secondary labels use UTF-8 byte ranges into the

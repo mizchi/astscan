@@ -1,63 +1,91 @@
 ---
 name: astscan
-description: Find code by AST shape and run structural lint checks with astscan. Use for ast-grep YAML rules, named captures, multi-rule repository scans, or integration with jev-lint or the astscan-core Rust library.
+description: Search source code by syntax tree with astscan. Use for structural code search or lint checks, inline pattern and Cypher queries, and inspecting Tree-sitter node kinds and fields.
 ---
 
 # astscan
 
-Run `astscan scan --rule rules.yml --json=stream --fail-on-skipped -- PATH...`.
-Use an installed `astscan` or build it from an astscan checkout with
-`cargo build --locked --release -p astscan` and use `target/release/astscan`.
-The build requires Rust 1.90 or newer and a C compiler.
+Inline queries and AST inspection require astscan 0.1.1 or later. Install
+with `cargo install astscan --locked` (Rust 1.90+ and a C compiler).
 
-## Write and check a rule
+## Search inline
 
-Choose the grammar with `language`. Start with a concrete source pattern and
-replace the part to capture with a named metavariable such as `$ARG`. Use `kind`
-for node types and `all`, `any`, `not`, `inside`, or `has` for structural
-conditions. Put multiple rule documents in one YAML file, separated by `---`.
-Run the rules together so astscan can parse each input once.
+Start with a concrete source pattern and replace the part to capture with a
+metavariable such as `$ARG`. Single-quote patterns in the shell to preserve
+the metavariables. Repeat `-p` and `--cypher` to run queries for one language
+in a single scan.
 
 ```sh
-work=$(mktemp -d)
-cat > "$work/rules.yml" <<'YAML'
-id: log-call
-language: JavaScript
-severity: warning
-rule:
-  pattern: console.log($ARG)
-YAML
-printf '%s\n' 'console.log("hello");' 'console.info("hello");' > "$work/example.js"
-astscan scan --rule "$work/rules.yml" --json=stream --fail-on-skipped -- "$work/example.js"
+astscan scan -l JavaScript -p 'console.log($ARG)' \
+  --cypher 'MATCH (f:function_declaration) RETURN f' --fail-on-skipped -- src
 ```
 
-Expect one match with `ruleId` equal to `log-call` and
-`metaVariables.single.ARG.text` equal to `"hello"` including the quotes.
-Check a representative example that should match and one that should be excluded
-before scanning a directory. See the [rule compatibility list](https://github.com/mizchi/astscan#compatibility)
-when porting rules. Apply code changes with a separate tool. astscan extracts
-matches, accepts `fix` without applying it, and rejects `transform` and `rewriters`.
+Inline IDs use the argument order across both query kinds (`pattern-1`,
+`cypher-2`). Try the query on one input that should match and one that
+should be excluded before widening the scan to a directory.
 
-For nested AST existence checks, use a `cypher:` document with `MATCH`,
-`RETURN`, and `EXISTS` or `NOT EXISTS` over `CHILD` and `DESCENDANT` edges.
-Use `PATTERN("$CALLEE($VALUE)")` at the start of the outer `WHERE` to emit
-captures and `[:CHILD {field: "arguments"}]` for a named direct edge.
-See the [Cypher example](https://github.com/mizchi/astscan#cypher-queries).
-For TypeScript audits that need symbol identity or data flow, see the
-[opt-in audit runner](https://github.com/mizchi/astscan/tree/main/experiments/typed-lint#audit-with-data-flow).
+## Inspect the grammar
 
-## Read results and compose scans
+Run `astscan debug FILE` for an S-expression with node kinds and field names.
+The grammar is inferred from the file extension. Set `-l` when piping a
+snippet, or use it to override the inferred grammar.
 
-- `--json=stream` emits one ast-grep-compatible match object per line with
+```sh
+printf '%s\n' 'x.y(1)' | astscan debug -l JavaScript -
+printf '%s\n' 'package demo' 'func f() { x.y(1) }' | astscan debug -l Go --json -
+```
+
+The call's `function` field contains `member_expression` in JavaScript and
+`selector_expression` in Go. With `--json`, check `hasErrors` and use each
+node's `kind`, `field`, and `parent` to build or diagnose a query. Pass the
+same `--config` to `debug` and `scan` when using custom grammars.
+
+## Batch structured rules
+
+Use `--rule -` with a quoted heredoc for explicit IDs, mixed languages, or
+capture constraints. Each JSON array element needs an `id`, a `language`,
+and either a `rule` object or a `cypher` string.
+
+```sh
+astscan scan --rule - --json=slim --fail-on-skipped -- src <<'JSON'
+[
+  {"id":"string-log","language":"JavaScript","rule":{"pattern":"console.log($ARG)"},
+   "constraints":{"ARG":{"kind":"string"}}},
+  {"id":"go-selectors","language":"Go","cypher":"MATCH (s:selector_expression) RETURN s"}
+]
+JSON
+```
+
+Use `--inline-rules "$rules"` when the JSON or YAML is already a shell
+variable. Use `--rule FILE` to reuse saved rules.
+[Rule compatibility](https://github.com/mizchi/astscan#compatibility).
+
+For nested AST checks, use `EXISTS` and `NOT EXISTS` over `CHILD` and
+`DESCENDANT` edges. Start the outer `WHERE` with
+`PATTERN("$CALLEE($VALUE)")` to emit captures. Restrict a direct edge to a
+named field with `[:CHILD {field: "arguments"}]`.
+[Cypher examples](https://github.com/mizchi/astscan#cypher-queries).
+
+## Read results
+
+- The default `--json=stream` emits one ast-grep-compatible match object per line with
   `file`, `ruleId`, `range`, and captures when present. Sort by path and byte
   range, using `ruleId` to break ties, if a consumer needs deterministic ordering.
-- `--json=slim` emits byte ranges and `ruleIds` for consumers that already
-  have the source. Use UTF-8 byte offsets to recover source text.
+- Prefer `--json=slim` for large scans when you can read the source. Each
+  match has `ruleIds`. Recover snippets using the half-open UTF-8 byte
+  ranges in `range.byteOffset`, including those on captures.
 - Directory scans honor `.gitignore`. An explicit file bypasses ignore filters
   and still needs a rule for its language. Use `--stats` to investigate skips.
   With `--fail-on-skipped`, exit 2 indicates an incomplete scan or a scan error.
-  Exit 1 indicates an error-severity match. Warnings can be present with exit 0.
-- In jev-lint, point `JEV_LINT_AST_GREP` to the astscan executable and run
-  `jev-lint check`. In Rust, compile YAML once with `RuleSet::compile`, share
-  the rules across workers, and reuse one `Scanner` per worker. Copy any match
-  data needed after the callback returns. See the [library quick start](https://github.com/mizchi/astscan/tree/main/crates/astscan-core#quick-start).
+  Exit 1 indicates an error-severity match. Exit 0 can include matches.
+- Apply edits with a separate tool. astscan accepts `fix` for compatibility
+  and emits matches.
+
+## Integrations
+
+- Set `JEV_LINT_AST_GREP` to the astscan executable for `jev-lint check`.
+- In Rust, share a compiled `RuleSet` and reuse one `Scanner` per worker.
+  Copy any match data needed after the callback.
+  [Library quick start](https://github.com/mizchi/astscan/tree/main/crates/astscan-core#quick-start).
+- For TypeScript queries that need symbol identity or cross-file data flow,
+  use the [opt-in audit runner](https://github.com/mizchi/astscan/tree/main/experiments/typed-lint#audit-with-data-flow).
