@@ -1,5 +1,5 @@
-//! Loading: an ast-grep rule file (multi-document YAML) and an optional
-//! `sgconfig.yml` for `customLanguages`.
+//! Load ast-grep rule documents and an optional `sgconfig.yml` for
+//! `customLanguages`.
 //!
 //! Loading is two steps. `plan_rules` reads the file far enough to know the
 //! grammars involved; `Plan::compile` builds the matchers. The split lets the
@@ -85,7 +85,7 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-  /// Compile ast-grep `rule` or astscan `cypher` documents from a YAML string.
+  /// Compile ast-grep `rule` or astscan `cypher` documents from YAML or a JSON array.
   pub fn compile(yaml: &str, registry: &mut Registry) -> Result<Self, String> {
     plan_yaml(yaml, "YAML", registry)?.compile()
   }
@@ -191,14 +191,27 @@ pub fn plan_rules(path: &Path, registry: &mut Registry) -> Result<Plan, String> 
   plan_yaml(&text, path.display(), registry)
 }
 
-fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry) -> Result<Plan, String> {
+pub fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry) -> Result<Plan, String> {
   use serde::Deserialize;
   let mut plan = Plan { langs: Vec::new(), pending: Vec::new() };
 
   for de in serde_yaml::Deserializer::from_str(text) {
-    let doc = Value::deserialize(de).map_err(|e| format!("Cannot parse rule {label}: {e}"))?;
+    match Value::deserialize(de).map_err(|e| format!("Cannot parse rule {label}: {e}"))? {
+      Value::Sequence(documents) => {
+        for doc in documents {
+          plan.push_rule(doc, registry)?;
+        }
+      }
+      doc => plan.push_rule(doc, registry)?,
+    }
+  }
+  Ok(plan)
+}
+
+impl Plan {
+  fn push_rule(&mut self, doc: Value, registry: &mut Registry) -> Result<(), String> {
     if doc.is_null() {
-      continue;
+      return Ok(());
     }
     let map = doc.as_mapping().ok_or("a rule document must be an object")?;
     let id = doc.get("id").and_then(|v| v.as_str()).ok_or("a rule needs an `id`")?;
@@ -217,7 +230,7 @@ fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry)
       "info" => Severity::Info,
       "warning" => Severity::Warning,
       "error" => Severity::Error,
-      "off" => continue,
+      "off" => return Ok(()),
       other => return Err(fail(format!("unknown severity `{other}`"))),
     };
     let lang_name = doc.get("language").and_then(|v| v.as_str()).ok_or_else(|| fail("a rule needs a `language`".into()))?;
@@ -239,19 +252,17 @@ fn plan_yaml(text: &str, label: impl std::fmt::Display, registry: &mut Registry)
       message: doc.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
     };
 
-    let unit = match plan.langs.iter().position(|l| Arc::ptr_eq(l, &lang)) {
+    let unit = match self.langs.iter().position(|l| Arc::ptr_eq(l, &lang)) {
       Some(unit) => unit,
       None => {
-        plan.langs.push(lang);
-        plan.langs.len() - 1
+        self.langs.push(lang);
+        self.langs.len() - 1
       }
     };
-    plan.pending.push(Pending { doc, meta, unit });
+    self.pending.push(Pending { doc, meta, unit });
+    Ok(())
   }
-  Ok(plan)
-}
 
-impl Plan {
   #[cfg(feature = "internals")]
   pub fn languages(&self) -> &[Arc<Lang>] {
     &self.langs

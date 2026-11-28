@@ -3,9 +3,10 @@
 //! The expected values were read off ast-grep 0.45.3 for the same input;
 //! `tools/diff.mjs` is the test that compares the two tools wholesale.
 
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 struct Case {
   dir: PathBuf,
@@ -43,19 +44,35 @@ impl Case {
   }
 
   fn run_paths(&self, json: &str, options: &[&str], paths: &[&str]) -> Run {
-    let out = Command::new(env!("CARGO_BIN_EXE_astscan"))
-      .current_dir(&self.dir)
-      .args(["scan", "--rule", "rules.yml", &format!("--json={json}")])
-      .args(options)
-      .arg("--")
-      .args(paths)
-      .output()
-      .unwrap();
+    let output = format!("--json={json}");
+    self.run_scan(["--rule", "rules.yml", &output].into_iter().chain(options.iter().copied()), paths, None)
+  }
+
+  fn run_scan<'a>(&self, options: impl IntoIterator<Item = &'a str>, paths: &[&str], stdin: Option<&str>) -> Run {
+    let mut command = self.command("scan");
+    command.args(options).arg("--").args(paths);
+    let out = output(command, stdin);
     let mut lines: Vec<Value> = String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
     lines.sort_by_key(|l| {
       (l["file"].as_str().map(str::to_string), l["range"]["byteOffset"]["start"].as_u64(), l["ruleId"].as_str().map(str::to_string))
     });
     Run { code: out.status.code().unwrap(), lines, stderr: String::from_utf8(out.stderr).unwrap() }
+  }
+
+  fn command(&self, subcommand: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_astscan"));
+    command.current_dir(&self.dir).arg(subcommand);
+    command
+  }
+}
+
+fn output(mut command: Command, stdin: Option<&str>) -> std::process::Output {
+  if let Some(input) = stdin {
+    let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+  } else {
+    command.output().unwrap()
   }
 }
 
@@ -65,6 +82,115 @@ fn rule(id: &str, language: &str, body: &str) -> String {
 
 fn texts(run: &Run) -> Vec<&str> {
   run.lines.iter().map(|l| l["text"].as_str().unwrap()).collect()
+}
+
+#[test]
+fn debug_infers_the_grammar_and_reports_ast_fields_and_utf8_offsets() {
+  let source = "const x: string = \"日本語\";";
+  let case = Case::new("debug-typescript", "", &[("a.ts", source)]);
+  let text = case.command("debug").arg("src/a.ts").output().unwrap();
+  assert!(text.status.success(), "{}", String::from_utf8_lossy(&text.stderr));
+  let sexp = String::from_utf8(text.stdout).unwrap();
+  assert!(sexp.contains("type: (type_annotation"), "{sexp}");
+  assert!(sexp.contains("value: (string"), "{sexp}");
+
+  let json = case.command("debug").args(["--json", "src/a.ts"]).output().unwrap();
+  assert!(json.status.success(), "{}", String::from_utf8_lossy(&json.stderr));
+  let ast: Value = serde_json::from_slice(&json.stdout).unwrap();
+  assert_eq!(ast["language"], "TypeScript");
+  assert_eq!(ast["hasErrors"], false);
+  let nodes = ast["nodes"].as_array().unwrap();
+  assert_eq!(nodes[0]["kind"], "program");
+  assert_eq!(nodes[0]["parent"], Value::Null);
+  let string = nodes.iter().find(|node| node["kind"] == "string" && node["named"] == true).unwrap();
+  assert_eq!(string["field"], "value");
+  let parent = string["parent"].as_u64().unwrap() as usize;
+  assert_eq!(nodes[parent]["kind"], "variable_declarator");
+  assert_eq!(nodes[parent]["id"], parent);
+  let start = string["startByte"].as_u64().unwrap() as usize;
+  let end = string["endByte"].as_u64().unwrap() as usize;
+  assert_eq!(&source[start..end], "\"日本語\"");
+  assert!(nodes.iter().any(|node| node["kind"] == "string" && node["named"] == false));
+  assert!(nodes.iter().any(|node| node["kind"] == ":" && node["named"] == false));
+}
+
+#[test]
+fn debug_accepts_stdin_and_exposes_syntax_errors() {
+  let case = Case::new("debug-stdin", "", &[]);
+  let missing = case.command("debug").arg("-").output().unwrap();
+  assert_eq!(missing.status.code(), Some(2));
+  assert!(String::from_utf8_lossy(&missing.stderr).contains("`--lang` is required for stdin"));
+
+  let mut command = case.command("debug");
+  command.args(["-l", "js", "--json", "-"]);
+  let result = output(command, Some("let ="));
+  assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+  let ast: Value = serde_json::from_slice(&result.stdout).unwrap();
+  assert_eq!(ast["language"], "JavaScript");
+  assert_eq!(ast["hasErrors"], true);
+  assert!(ast["nodes"].as_array().unwrap().iter().any(|node| node["kind"] == "ERROR"));
+}
+
+#[test]
+fn patterns_and_cypher_can_be_batched_on_the_command_line() {
+  let case = Case::new("direct-queries", "", &[("a.js", "console.log(\"hello\");\ndebugger;\n")]);
+  let options = ["-l", "js", "-p", "console.log($ARG)", "--cypher", "MATCH (d:debugger_statement) RETURN d", "--cache", "cache", "--stats"];
+  let run = case.run_scan(options, &["src"], None);
+  assert_eq!(run.code, 0, "{}", run.stderr);
+  assert_eq!(texts(&run), ["console.log(\"hello\")", "debugger;"]);
+  assert_eq!(run.lines[0]["ruleId"], "pattern-1");
+  assert_eq!(run.lines[0]["metaVariables"]["single"]["ARG"]["text"], "\"hello\"");
+  assert_eq!(run.lines[1]["ruleId"], "cypher-2");
+  assert!(run.stderr.contains("2 rules in 2 groups, 1 files"), "{}", run.stderr);
+  let warm = case.run_scan(options, &["src"], None);
+  assert_eq!(warm.lines, run.lines);
+  assert_eq!(stat(&warm, "cache:"), "1 hits, 0 misses");
+  let mut changed = options;
+  changed[3] = "alert($ARG)";
+  let changed = case.run_scan(changed, &["src"], None);
+  assert_eq!(texts(&changed), ["debugger;"]);
+  assert_eq!(stat(&changed, "cache:"), "0 hits, 1 misses");
+}
+
+#[test]
+fn json_batch_is_equivalent_to_yaml_file_for_inline_and_stdin_inputs() {
+  let yaml = [
+    "id: numeric-log\nlanguage: JavaScript\nseverity: error\nrule: { pattern: 'console.log($ARG)' }\nconstraints: { ARG: { kind: number } }\n",
+    "id: go-fn\nlanguage: Go\ncypher: 'MATCH (f:function_declaration) RETURN f'\n",
+  ]
+  .join("---\n");
+  let batch = json!([
+    {
+      "id": "numeric-log", "language": "JavaScript", "severity": "error",
+      "rule": {"pattern": "console.log($ARG)"}, "constraints": {"ARG": {"kind": "number"}}
+    },
+    {"id": "go-fn", "language": "Go", "cypher": "MATCH (f:function_declaration) RETURN f"},
+  ])
+  .to_string();
+  let case = Case::new("inline-json", &yaml, &[("a.js", "console.log(1); console.log(x);"), ("b.go", "package p\nfunc f() {}\n")]);
+  let file = case.run("stream");
+  assert_eq!(file.code, 1);
+  assert_eq!(texts(&file), ["console.log(1)", "func f() {}"]);
+  std::fs::remove_file(case.dir.join("rules.yml")).unwrap();
+  for run in [
+    case.run_scan(["--inline-rules", &batch], &["src"], None),
+    case.run_scan(["--rule", "-"], &["src"], Some(&batch)),
+    case.run_scan(["--rule", "-"], &["src"], Some(&yaml)),
+  ] {
+    assert_eq!(run.code, file.code, "{}", run.stderr);
+    assert_eq!(run.lines, file.lines);
+  }
+}
+
+#[test]
+fn inline_queries_require_a_language_and_exclusive_rule_input() {
+  let case = Case::new("inline-arguments", "", &[]);
+  let missing = case.run_scan(["--pattern", "x"], &["src"], None);
+  assert_eq!(missing.code, 2);
+  assert!(missing.stderr.contains("`--lang` is required"), "{}", missing.stderr);
+  let mixed = case.run_scan(["--rule", "rules.yml", "--inline-rules", "[]"], &["src"], None);
+  assert_eq!(mixed.code, 2);
+  assert!(mixed.stderr.contains("choose one rule input"), "{}", mixed.stderr);
 }
 
 #[test]

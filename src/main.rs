@@ -1,17 +1,20 @@
 mod cache;
+mod debug;
 mod output;
 mod record;
 mod scan;
 mod simd;
 
-use astscan_core::internals::{HTML, INJECTABLE, ScanOptions, Target, plan_rules};
+use astscan_core::internals::{HTML, INJECTABLE, ScanOptions, Target, plan_yaml};
 use astscan_core::{LiteralPrefilter, ParserKind, Registry, ScanOptimizations, load_sgconfig};
 use cache::{Cache, ruleset_key};
 use ignore::WalkState;
 use ignore::types::TypesBuilder;
 use output::Mode;
 use scan::{Compiled, Shared, Worker};
-use std::path::PathBuf;
+use serde_json::{Value, json};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -22,10 +25,19 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const USAGE: &str = "\
 astscan: structural search over a source tree
 
-Usage: astscan scan --rule <FILE> [OPTIONS] [--] [PATHS]...
+Usage: astscan scan <RULE INPUT> [OPTIONS] [--] [PATHS]...
+       astscan debug [OPTIONS] [--] [FILE|-]
+
+Use `astscan debug --help` for AST inspection options.
+
+Rule input:
+  -r, --rule <FILE|->        Read YAML or a JSON array from a file or stdin
+      --inline-rules <TEXT> Pass YAML or a JSON array as an argument
+  -p, --pattern <PATTERN>   Match a source pattern (repeatable)
+      --cypher <QUERY>      Run a structural Cypher query (repeatable)
+  -l, --lang <LANGUAGE>     Language for every pattern or Cypher argument
 
 Options:
-  -r, --rule <FILE>     Multi-document YAML with ast-grep rules or Cypher queries
   -c, --config <FILE>   sgconfig.yml, read for `customLanguages`
       --json[=<STYLE>]  stream: ast-grep's JSON lines (default)
                         slim:   one line per match, no source text, all rule ids
@@ -39,8 +51,52 @@ Options:
   -V, --version         Print version
 ";
 
+const RULE_INPUT: &str = "choose one rule input from `--rule`, `--inline-rules`, or `--pattern` / `--cypher`";
+
+enum RuleInput {
+  File(PathBuf),
+  Inline { label: &'static str, text: String },
+}
+
+enum Query {
+  Pattern(String),
+  Cypher(String),
+}
+
+impl RuleInput {
+  fn queries(language: &str, queries: Vec<Query>) -> Self {
+    let documents = queries
+      .into_iter()
+      .enumerate()
+      .map(|(i, query)| {
+        let i = i + 1;
+        match query {
+          Query::Pattern(pattern) => json!({"id": format!("pattern-{i}"), "language": language, "rule": {"pattern": pattern}}),
+          Query::Cypher(cypher) => json!({"id": format!("cypher-{i}"), "language": language, "cypher": cypher}),
+        }
+      })
+      .collect();
+    Self::Inline { label: "inline queries", text: Value::Array(documents).to_string() }
+  }
+
+  fn read(self) -> Result<(String, String), String> {
+    match self {
+      Self::File(path) if path == Path::new("-") => {
+        let mut text = String::new();
+        std::io::stdin().lock().read_to_string(&mut text).map_err(|e| format!("Cannot read rules from stdin: {e}"))?;
+        Ok((text, "stdin".into()))
+      }
+      Self::File(path) => {
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("Cannot read rule {}: {e}", path.display()))?;
+        Ok((text, path.display().to_string()))
+      }
+      Self::Inline { label, text } => Ok((text, label.into())),
+    }
+  }
+}
+
 struct Args {
-  rule: PathBuf,
+  rule: RuleInput,
   config: Option<PathBuf>,
   mode: Mode,
   threads: usize,
@@ -51,23 +107,19 @@ struct Args {
   paths: Vec<PathBuf>,
 }
 
-fn parse_args() -> Result<Option<Args>, String> {
-  let mut argv = std::env::args().skip(1).peekable();
-  match argv.peek().map(String::as_str) {
-    Some("scan") => {
-      argv.next();
-    }
-    Some("-h" | "--help") | None => {
-      print!("{USAGE}");
-      return Ok(None);
-    }
-    Some("-V" | "--version") => {
-      println!("astscan {}", env!("CARGO_PKG_VERSION"));
-      return Ok(None);
-    }
-    Some(other) => return Err(format!("unknown command `{other}`; only `scan` is supported")),
+fn split_option(arg: &str) -> (&str, Option<&str>) {
+  match arg.split_once('=') {
+    Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+    // `-j8`: a short flag with its value attached.
+    _ if arg.len() > 2 && arg.starts_with('-') && !arg.starts_with("--") && arg.is_char_boundary(2) => (&arg[..2], Some(&arg[2..])),
+    _ => (arg, None),
   }
+}
+
+fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
   let (mut rule, mut config, mut mode, mut threads, mut stats, mut paths) = (None, None, Mode::Stream, 0usize, false, Vec::new());
+  let mut queries = Vec::new();
+  let mut language = None;
   let mut fast_parser = false;
   let mut fail_on_skipped = false;
   let mut cache = None;
@@ -77,20 +129,29 @@ fn parse_args() -> Result<Option<Args>, String> {
       paths.push(PathBuf::from(arg));
       continue;
     }
-    let (flag, inline) = match arg.split_once('=') {
-      Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
-      // `-j8`: a short flag with its value attached.
-      _ if arg.len() > 2 && arg.starts_with('-') && !arg.starts_with("--") => (arg[..2].to_string(), Some(arg[2..].to_string())),
-      _ => (arg.clone(), None),
-    };
-    let mut value = |name: &str| inline.clone().or_else(|| argv.next()).ok_or_else(|| format!("`{name}` needs a value"));
-    match flag.as_str() {
+    let (flag, inline) = split_option(&arg);
+    let mut value = |name: &str| inline.map(str::to_owned).or_else(|| argv.next()).ok_or_else(|| format!("`{name}` needs a value"));
+    match flag {
       "--" => only_paths = true,
       "-h" | "--help" => {
         print!("{USAGE}");
         return Ok(None);
       }
-      "-r" | "--rule" => rule = Some(PathBuf::from(value("--rule")?)),
+      "-r" | "--rule" | "--inline-rules" => {
+        let input = if flag == "--inline-rules" {
+          RuleInput::Inline { label: "--inline-rules", text: value("--inline-rules")? }
+        } else {
+          RuleInput::File(PathBuf::from(value("--rule")?))
+        };
+        // Repeated --rule keeps the last path, as in previous releases.
+        if matches!((&rule, &input), (Some(RuleInput::Inline { .. }), _) | (Some(RuleInput::File(_)), RuleInput::Inline { .. })) {
+          return Err(RULE_INPUT.into());
+        }
+        rule = Some(input);
+      }
+      "-p" | "--pattern" => queries.push(Query::Pattern(value("--pattern")?)),
+      "--cypher" => queries.push(Query::Cypher(value("--cypher")?)),
+      "-l" | "--lang" => language = Some(value("--lang")?),
       "-c" | "--config" => config = Some(PathBuf::from(value("--config")?)),
       "-j" | "--threads" => threads = value("--threads")?.parse().map_err(|_| "`--threads` needs a number".to_string())?,
       "--stats" => stats = true,
@@ -104,7 +165,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         }
       }
       "--json" => {
-        mode = match inline.as_deref() {
+        mode = match inline {
           None | Some("stream") => Mode::Stream,
           Some("slim") => Mode::Slim,
           Some(other) => return Err(format!("unsupported `--json={other}`; use `stream` or `slim`")),
@@ -117,7 +178,18 @@ fn parse_args() -> Result<Option<Args>, String> {
   if paths.is_empty() {
     paths.push(PathBuf::from("."));
   }
-  let rule = rule.ok_or("`--rule <FILE>` is required")?;
+  let rule = if queries.is_empty() {
+    if language.is_some() {
+      return Err("`--lang` requires `--pattern` or `--cypher`".into());
+    }
+    rule.ok_or(RULE_INPUT)?
+  } else {
+    if rule.is_some() {
+      return Err(RULE_INPUT.into());
+    }
+    let language = language.ok_or("`--lang` is required with `--pattern` or `--cypher`")?;
+    RuleInput::queries(&language, queries)
+  };
   Ok(Some(Args { rule, config, mode, threads, stats, fail_on_skipped, fast_parser, cache, paths }))
 }
 
@@ -147,25 +219,22 @@ const COMPILER_STACK: usize = 16 << 20;
 /// Everything but the scanned file that decides what a file's matches are:
 /// this build, the rules, and the grammars loaded from outside. Not the
 /// output style: the cache holds matches, and either style is written from them.
-fn cache_key(args: &Args, registry: &Registry) -> Result<u128, String> {
-  let read = |path: &PathBuf| std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()));
+fn cache_key(rules: &[u8], config: Option<&Path>, registry: &Registry) -> Result<u128, String> {
+  let read = |path: &Path| std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()));
   // The size of the executable stands in for a build id between releases.
   let build = std::env::current_exe().and_then(std::fs::metadata).map_or(0, |m| m.len());
-  let mut parts: Vec<Vec<u8>> = vec![
-    env!("CARGO_PKG_VERSION").as_bytes().to_vec(),
+  let build = build.to_le_bytes();
+  let config = config.map(read).transpose()?.unwrap_or_default();
+  let libraries = registry.custom_libraries.iter().map(|path| read(path)).collect::<Result<Vec<_>, _>>()?;
+  let mut parts: Vec<&[u8]> = vec![
+    env!("CARGO_PKG_VERSION").as_bytes(),
     // Older builds stored skipped inputs as successful zero-match scans.
-    b"completed-scans-v1".to_vec(),
-    build.to_le_bytes().to_vec(),
-    read(&args.rule)?,
-    match &args.config {
-      Some(config) => read(config)?,
-      None => Vec::new(),
-    },
+    b"completed-scans-v1",
+    &build,
+    rules,
+    &config,
   ];
-  for library in &registry.custom_libraries {
-    parts.push(read(library)?);
-  }
-  let parts: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+  parts.extend(libraries.iter().map(Vec::as_slice));
   Ok(ruleset_key(&parts))
 }
 
@@ -190,8 +259,8 @@ impl Drop for Batch<'_> {
   }
 }
 
-fn run() -> Result<ExitCode, String> {
-  let Some(args) = parse_args()? else { return Ok(ExitCode::SUCCESS) };
+fn run_scan(argv: impl Iterator<Item = String>) -> Result<ExitCode, String> {
+  let Some(args) = parse_args(argv)? else { return Ok(ExitCode::SUCCESS) };
   let started = std::time::Instant::now();
   // Tree-sitter allocates a node per token; give it the same allocator as the rest.
   // SAFETY: called before any other tree-sitter call, with one allocator family.
@@ -208,7 +277,8 @@ fn run() -> Result<ExitCode, String> {
     // SAFETY: --config selects a trusted local file and its native grammars.
     unsafe { load_sgconfig(config, &mut registry) }?;
   }
-  let plan = plan_rules(&args.rule, &mut registry)?;
+  let (rule_text, label) = args.rule.read()?;
+  let plan = plan_yaml(&rule_text, label, &mut registry)?;
   let loaded = started.elapsed();
   if plan.languages().is_empty() {
     return Ok(ExitCode::SUCCESS);
@@ -258,9 +328,10 @@ fn run() -> Result<ExitCode, String> {
   walk.require_git(false).threads(threads).types(types.build().map_err(|e| e.to_string())?);
 
   let cache = match &args.cache {
-    Some(dir) => Some(Cache::open(dir, cache_key(&args, &registry)?)),
+    Some(dir) => Some(Cache::open(dir, cache_key(rule_text.as_bytes(), args.config.as_deref(), &registry)?)),
     None => None,
   };
+  drop(rule_text);
   let defaults = ScanOptimizations::default();
   let shared = Shared {
     rules: compiled,
@@ -415,6 +486,23 @@ fn run() -> Result<ExitCode, String> {
   } else {
     ExitCode::SUCCESS
   })
+}
+
+fn run() -> Result<ExitCode, String> {
+  let mut argv = std::env::args().skip(1);
+  match argv.next().as_deref() {
+    Some("scan") => run_scan(argv),
+    Some("debug") => debug::run(argv),
+    Some("-h" | "--help") | None => {
+      print!("{USAGE}");
+      Ok(ExitCode::SUCCESS)
+    }
+    Some("-V" | "--version") => {
+      println!("astscan {}", env!("CARGO_PKG_VERSION"));
+      Ok(ExitCode::SUCCESS)
+    }
+    Some(other) => Err(format!("unknown command `{other}`; use `scan` or `debug`")),
+  }
 }
 
 fn main() -> ExitCode {

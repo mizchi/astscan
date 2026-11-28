@@ -20,7 +20,7 @@ pub use scan::{LiteralPrefilter, Match, ParserKind, ScanError, ScanOptimizations
 #[cfg(feature = "internals")]
 #[doc(hidden)]
 pub mod internals {
-  pub use crate::config::plan_rules;
+  pub use crate::config::{plan_rules, plan_yaml};
   pub use crate::fastparse::{Bail, Parser as FastParser};
   pub use crate::found::{Found, Span};
   pub use crate::lang::{HTML, INJECTABLE};

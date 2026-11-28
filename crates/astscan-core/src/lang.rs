@@ -33,6 +33,17 @@ impl Lang {
     self._library.is_none().then_some(&self.ts)
   }
 
+  /// Access the grammar used by this language.
+  ///
+  /// # Safety
+  ///
+  /// Keep this `Lang` alive until all grammar copies, parsers, trees, and
+  /// grammar-backed references made from them have been dropped.
+  #[cfg(feature = "internals")]
+  pub unsafe fn tree_sitter_language(&self) -> &Language {
+    &self.ts
+  }
+
   /// 0 means the grammar has no such kind.
   pub fn kind_to_id(&self, kind: &str) -> u16 {
     self.ts.id_for_node_kind(kind, true)
