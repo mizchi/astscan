@@ -59,5 +59,5 @@ tree-sitter when it needs error recovery. Building the library requires a C
 compiler for the grammars and the tree-flattening routine.
 
 See the [supported rule syntax](https://github.com/mizchi/astscan#compatibility)
-and [CLI benchmarks](https://github.com/mizchi/astscan/blob/main/docs/performance.md).
+and [Rust crate benchmarks](https://github.com/mizchi/astscan/blob/main/docs/performance.md#rust-library-benchmark).
 Licensed under MIT.

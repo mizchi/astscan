@@ -10,6 +10,9 @@ astscan's compact `--json=slim` output, the same scan took 0.43 s, about
 **50× faster** than the ast-grep baseline. A separate astscan 0.1.0 spot
 check on Go's `net` package measured **2.1×** with identical stream matches.
 [Benchmark conditions and full results](https://github.com/mizchi/astscan/blob/main/docs/performance.md).
+In a 16-rule Go library benchmark, `astscan-core` used **386 ms** of median
+CPU time and ast-grep's `CombinedScan` used **683 ms**.
+[Rust crate benchmark](https://github.com/mizchi/astscan/blob/main/docs/performance.md#rust-library-benchmark).
 
 - [`astscan-core`](https://github.com/mizchi/astscan/tree/main/crates/astscan-core) is the Rust library. It compiles
   rule YAML once and returns structured matches from in-memory source.

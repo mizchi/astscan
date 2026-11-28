@@ -42,6 +42,51 @@ hyperfine --warmup 3 --runs 15 --output null \
   "\"$ASTSCAN\" scan --rule \"$GO_RULES\" --json=slim --threads 4 -- ."
 ```
 
+### Rust library benchmark
+
+The [benchmark harness](../experiments/library-bench/) measures the Rust
+APIs on 436 Go files (4,504,610 bytes) under Go 1.27.3's `src/net`. It
+tests one call rule (`fmt.Errorf`) and a batch of 16 call rules. The
+engines share Tree-sitter 0.27.0 and the Go grammar 0.25.0. The timed
+section reads preloaded source and measures parsing, matching, and
+collecting byte spans with rule IDs. Rule compilation and per-file
+equality checks run before timing.
+
+- `astscan-core` 0.1.0 uses the scanner from release candidate `5ca4760`,
+  with its default file literal prefilter and again with the prefilter off.
+- [ast-grep 0.51.3](https://crates.io/crates/ast-grep-config/0.51.3) uses
+  the same YAML and reuses one `CombinedScan` for the rule batch.
+- [Tree-sitter 0.27.0](https://docs.rs/tree-sitter/0.27.0/tree_sitter/struct.QueryCursor.html)
+  reuses one compiled query containing the equivalent call patterns and
+  callee predicates.
+
+Measured on an Apple M5 with macOS 26.6.2 and Rust 1.100.0, using one
+thread, 3 warm-ups, and 15 timed scans per configuration. The table gives
+median process CPU time in milliseconds, with the middle 50% of samples
+in parentheses. Concurrent system load made wall time more variable. The
+harness reports both clocks.
+
+| Rust API | 1 rule, 317 matches | 16 rules, 9,010 matches |
+| --- | ---: | ---: |
+| `astscan-core` | 297 (285–323) | 386 (366–456) |
+| `astscan-core`, prefilter off | 398 (380–412) | 378 (352–397) |
+| ast-grep `CombinedScan` | 589 (571–606) | 683 (655–706) |
+| Tree-sitter `QueryCursor` | 499 (455–525) | 516 (498–594) |
+
+The one-rule scan benefits from skipping files that lack the required
+literal. With 16 rules the middle 50% of samples overlap between the two
+astscan configurations.
+
+Run from the repository root with Go 1.27.3 on PATH. The harness prints
+raw samples and checks that each engine returns the same spans and rule
+IDs for every file.
+
+```sh
+cargo run --release --locked \
+  --manifest-path experiments/library-bench/Cargo.toml \
+  --target-dir target/library-bench -- "$(go env GOROOT)/src/net"
+```
+
 ### Implementation
 
 - **One tree walk per file, not one per rule.** The tree-sitter tree is

@@ -1,0 +1,22 @@
+[package]
+name = "astscan-library-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+astscan-core = { path = "../../crates/astscan-core" }
+ast-grep-config = "=0.51.3"
+ast-grep-core = "=0.51.3"
+ast-grep-language = { version = "=0.51.3", default-features = false, features = ["tree-sitter-go"] }
+cpu-time = "=1.0.0"
+tree-sitter = "=0.27.0"
+tree-sitter-go = "=0.25.0"
+serde_json = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

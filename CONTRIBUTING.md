@@ -38,24 +38,34 @@ The [experiments](experiments/) have their own setup and checks.
 
 ## Release
 
-The release contains the `astscan-core` Rust library and the `astscan` CLI.
+The crates.io release contains `astscan-core` and its companion `astscan`
+CLI. Their manifests define the files in each archive.
+
+### Prepare the release candidate
+
 Update both manifests and the CLI's core dependency to the same version,
-then refresh the workspace lockfile. Commit user-visible changes with
-Conventional Commits before generating
-`CHANGELOG.md` with git-cliff and write a short summary with a runnable example
-in `.github/releases/v<version>.md`.
+then refresh the workspace lockfile. Write a short summary with a runnable
+example in `.github/releases/v<version>.md`. Generate `CHANGELOG.md` from
+Conventional Commits with git-cliff 2.10 or later. The generator filters
+commits that only touch `experiments/`.
 
 ```sh
 export RELEASE_TAG=v0.1.0
 GITHUB_TOKEN="$(gh auth token)" git-cliff --tag "$RELEASE_TAG" --output CHANGELOG.md
 node tools/release.mjs "$RELEASE_TAG" /tmp/astscan-release-notes.md
+```
+
+Review the generated notes and commit the release files. Run the packaging
+checks from a clean checkout of that commit. A separate worktree lets you
+verify that commit while keeping local experiment work in progress.
+
+```sh
 cargo package --locked -p astscan-core -p astscan
 cargo publish --dry-run --locked -p astscan-core -p astscan
 ```
 
-Review the generated changelog, the release notes, and both crate archives.
-Commit the release files before publishing. Use a clean checkout of that
-commit for the first upload and the tag.
+Review both archives under `target/package/` and check the GitHub CI results
+for the release commit before publishing.
 
 ### First crates.io release
 
@@ -67,10 +77,10 @@ cargo publish --locked -p astscan-core
 cargo publish --locked -p astscan
 ```
 
-After both versions appear in the index, revoke the initial token. Register
-`mizchi/astscan`, workflow `release.yml`, and environment `release` as a
-Trusted Publisher on each crate. Create the `release` environment in GitHub
-and allow version tags to deploy to it. See the
+After both versions appear in the index, revoke the initial token. Create
+the `release` environment in GitHub and allow version tags to deploy to it.
+Register `mizchi/astscan`, workflow `release.yml`, and environment `release`
+as a Trusted Publisher on each crate. See the
 [crates.io Trusted Publishing guide](https://crates.io/docs/trusted-publishing).
 
 ### Tag and publish

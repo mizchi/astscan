@@ -13,3 +13,6 @@ Run a probe with `cargo run --release -p astscan-experiments --bin <probe> -- â€
 opt-in tsrs type queries over slim JSON matches. It also includes
 [compiler diagnostics and runtime traces](typed-lint/#compiler-diagnostics-and-runtime-traces)
 for TypeScript, JavaScript, Go, and Rust.
+
+The standalone [Rust library benchmark](library-bench/) compares the
+in-memory scan APIs. See [results and reproduction steps](../docs/performance.md#rust-library-benchmark).
