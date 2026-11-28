@@ -5,8 +5,10 @@ description: Search source code by syntax tree with astscan. Use for structural 
 
 # astscan
 
-Inline queries and AST inspection require astscan 0.1.1 or later. Install
-with `cargo install astscan --locked` (Rust 1.90+ and a C compiler).
+Inline queries and AST inspection require astscan 0.1.1 or later. Use a
+prebuilt archive for macOS, Linux, or Windows. To build from source, run
+`cargo install astscan --locked` (Rust 1.90+ and a C compiler).
+[Installation](https://github.com/mizchi/astscan#installation).
 
 ## Search inline
 

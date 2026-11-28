@@ -8,7 +8,47 @@ matches as JSON Lines with captures and UTF-8 byte ranges.
 
 ## Installation
 
-Use Rust 1.90 or later and a C compiler.
+Get a prebuilt archive and `SHA256SUMS` from the
+[latest GitHub Release](https://github.com/mizchi/astscan/releases/latest).
+The archives run without a Rust toolchain.
+
+| Platform | Archive |
+| --- | --- |
+| macOS Apple Silicon | `astscan-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `astscan-x86_64-apple-darwin.tar.gz` |
+| Linux x64 | `astscan-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 | `astscan-aarch64-unknown-linux-musl.tar.gz` |
+| Windows x64 | `astscan-x86_64-pc-windows-msvc.zip` |
+
+On macOS or Linux, set `archive` to your platform's archive.
+
+```sh
+archive=astscan-aarch64-apple-darwin.tar.gz
+url=https://github.com/mizchi/astscan/releases/latest/download
+(
+  set -e
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  cd "$work"
+  curl -fsSLO "$url/$archive" -O "$url/SHA256SUMS"
+  awk -v archive="$archive" '$2 == archive' SHA256SUMS > checksum
+  if command -v sha256sum >/dev/null; then
+    sha256sum -c checksum
+  else
+    shasum -a 256 -c checksum
+  fi
+  tar -xzf "$archive"
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 astscan "$HOME/.local/bin/astscan"
+  "$HOME/.local/bin/astscan" --version
+)
+```
+
+Add `$HOME/.local/bin` to your `PATH` for the examples below. On Windows,
+compare the ZIP's `Get-FileHash` output with `SHA256SUMS`, extract it, and
+put `astscan.exe` in a directory on your `PATH`.
+
+To build from source, use Rust 1.90 or later and a C compiler.
 
 ```sh
 cargo install astscan --version 0.1.1 --locked

@@ -1,0 +1,142 @@
+name: Release binaries
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing GitHub Release tag
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astscan-binaries-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: windows-2025, target: x86_64-pc-windows-msvc }
+    env:
+      TAG: ${{ inputs.tag }}
+      TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate release tag
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a version tag such as v0.1.1" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          persist-credentials: false
+      - name: Install musl C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools
+      - name: Build stripped executable
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: symbols
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          rustup target add "$TARGET"
+          cargo build --locked --release -p astscan --target "$TARGET"
+      - name: Package and test archive
+        id: package
+        run: |
+          exe=astscan
+          if [[ "$RUNNER_OS" == Windows ]]; then exe=astscan.exe; fi
+          mkdir -p bundle dist smoke
+          cp "target/$TARGET/release/$exe" LICENSE bundle/
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            archive="dist/astscan-$TARGET.zip"
+            tar.exe -a -cf "$archive" -C bundle "$exe" LICENSE
+            tar.exe -xf "$archive" -C smoke
+          else
+            archive="dist/astscan-$TARGET.tar.gz"
+            tar -czf "$archive" -C bundle "$exe" LICENSE
+            tar -xzf "$archive" -C smoke
+          fi
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            readelf -lW "smoke/$exe" > smoke/headers
+            if grep -q INTERP smoke/headers; then
+              echo "Expected a statically linked Linux executable" >&2
+              exit 1
+            fi
+          fi
+          test "$("smoke/$exe" --version | tr -d '\r')" = "astscan ${TAG#v}"
+          printf '%s\n' 'console.log("hello");' > smoke/sample.js
+          # shellcheck disable=SC2016
+          "smoke/$exe" scan -l JavaScript -p 'console.log($ARG)' -- smoke/sample.js > smoke/matches
+          grep -Fq '"ruleId":"pattern-1"' smoke/matches
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: astscan-${{ matrix.target }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  attach:
+    name: Attach archives and checksums
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: astscan-*
+          path: dist
+          merge-multiple: true
+      - name: Upload release assets
+        working-directory: dist
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          archives=(astscan-*.tar.gz astscan-*.zip)
+          for archive in "${archives[@]}"; do test -s "$archive"; done
+          existing=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          for archive in "${archives[@]}"; do
+            if grep -Fxq "$archive" <<< "$existing"; then
+              gh release download "$TAG" --pattern "$archive" --clobber
+            else
+              gh release upload "$TAG" "$archive"
+            fi
+          done
+          sha256sum "${archives[@]}" > SHA256SUMS
+          if grep -Fxq SHA256SUMS <<< "$existing"; then
+            gh release download "$TAG" --pattern SHA256SUMS --output previous-checksums
+            cmp previous-checksums SHA256SUMS
+          else
+            gh release upload "$TAG" SHA256SUMS
+          fi

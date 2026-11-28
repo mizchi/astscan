@@ -58,3 +58,11 @@ jobs:
           fi
           gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
             --notes-file "$RUNNER_TEMP/astscan-release-notes.md" "${prerelease[@]}"
+
+  binaries:
+    needs: release
+    permissions:
+      contents: write
+    uses: ./.github/workflows/binaries.yml
+    with:
+      tag: ${{ github.ref_name }}

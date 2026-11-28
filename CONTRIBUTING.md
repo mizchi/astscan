@@ -95,3 +95,13 @@ versions in the index and creates the GitHub Release.
 git tag "$RELEASE_TAG"
 git push origin "$RELEASE_TAG"
 ```
+
+After the GitHub Release is created, the binary workflow builds the tagged
+source, smoke-tests the executable from each archive, and attaches the
+archives and `SHA256SUMS`. Linux archives use static musl targets.
+To add binaries to an existing release, run the same workflow with its tag
+from the default branch.
+
+```sh
+gh workflow run binaries.yml -f tag="$RELEASE_TAG"
+```
