@@ -30,8 +30,8 @@ jobs:
         include:
           - { os: macos-15, target: aarch64-apple-darwin }
           - { os: macos-15-intel, target: x86_64-apple-darwin }
-          - { os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
           - { os: windows-2025, target: x86_64-pc-windows-msvc }
     env:
       TAG: ${{ inputs.tag }}
@@ -50,18 +50,9 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.tag }}
           persist-credentials: false
-      - name: Install musl C toolchain
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y musl-tools
       - name: Build stripped executable
         env:
           CARGO_PROFILE_RELEASE_STRIP: symbols
-          CC_x86_64_unknown_linux_musl: musl-gcc
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
         run: |
           rustup target add "$TARGET"
@@ -81,13 +72,6 @@ jobs:
             archive="dist/astscan-$TARGET.tar.gz"
             tar -czf "$archive" -C bundle "$exe" LICENSE
             tar -xzf "$archive" -C smoke
-          fi
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            readelf -lW "smoke/$exe" > smoke/headers
-            if grep -q INTERP smoke/headers; then
-              echo "Expected a statically linked Linux executable" >&2
-              exit 1
-            fi
           fi
           test "$("smoke/$exe" --version | tr -d '\r')" = "astscan ${TAG#v}"
           printf '%s\n' 'console.log("hello");' > smoke/sample.js

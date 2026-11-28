@@ -16,8 +16,8 @@ The archives run without a Rust toolchain.
 | --- | --- |
 | macOS Apple Silicon | `astscan-aarch64-apple-darwin.tar.gz` |
 | macOS Intel | `astscan-x86_64-apple-darwin.tar.gz` |
-| Linux x64 | `astscan-x86_64-unknown-linux-musl.tar.gz` |
-| Linux ARM64 | `astscan-aarch64-unknown-linux-musl.tar.gz` |
+| Linux x64 (glibc 2.35+) | `astscan-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux ARM64 (glibc 2.35+) | `astscan-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows x64 | `astscan-x86_64-pc-windows-msvc.zip` |
 
 On macOS or Linux, set `archive` to your platform's archive.

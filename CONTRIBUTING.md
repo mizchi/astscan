@@ -98,7 +98,8 @@ git push origin "$RELEASE_TAG"
 
 After the GitHub Release is created, the binary workflow builds the tagged
 source, smoke-tests the executable from each archive, and attaches the
-archives and `SHA256SUMS`. Linux archives use static musl targets.
+archives and `SHA256SUMS`. The Linux builds use Ubuntu 22.04 to set a glibc
+baseline and support dynamic loading of custom grammars.
 To add binaries to an existing release, run the same workflow with its tag
 from the default branch.
 
